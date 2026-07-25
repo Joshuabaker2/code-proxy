@@ -111,6 +111,9 @@ func listAccounts(w http.ResponseWriter, r *http.Request, db *database.DB) {
 	if accounts == nil {
 		accounts = []database.Account{}
 	}
+	for i := range accounts {
+		accounts[i] = sanitizedAccount(accounts[i])
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(accounts)
 }
@@ -154,7 +157,7 @@ func createAccount(w http.ResponseWriter, r *http.Request, db *database.DB) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(acct)
+	json.NewEncoder(w).Encode(sanitizedAccount(*acct))
 }
 
 func updateAccount(w http.ResponseWriter, r *http.Request, db *database.DB, id string) {
@@ -216,7 +219,7 @@ func accountStatus(w http.ResponseWriter, db *database.DB, id string) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(acct)
+	json.NewEncoder(w).Encode(sanitizedAccount(*acct))
 }
 
 func refreshAccount(w http.ResponseWriter, db *database.DB, id string) {
@@ -294,7 +297,7 @@ func handleOAuthCallback(w http.ResponseWriter, r *http.Request, db *database.DB
 		FlowID       string `json:"flow_id"`
 		CallbackURL  string `json:"callback_url"`
 		ProviderType string `json:"provider_type"` // Used to create the account
-		Label        string `json:"label"`          // Custom label (optional)
+		Label        string `json:"label"`         // Custom label (optional)
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, "Invalid JSON", http.StatusBadRequest)
@@ -327,6 +330,9 @@ func handleOAuthCallback(w http.ResponseWriter, r *http.Request, db *database.DB
 	if providerType == "" {
 		providerType = "anthropic-api" // default
 	}
+	if providerType == "claude-cli" {
+		providerType = "anthropic-api"
+	}
 
 	label := req.Label
 	if label == "" {
@@ -355,23 +361,26 @@ func handleOAuthCallback(w http.ResponseWriter, r *http.Request, db *database.DB
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(acct)
+	json.NewEncoder(w).Encode(sanitizedAccount(*acct))
+}
+
+func sanitizedAccount(acct database.Account) database.Account {
+	acct.AccessToken = ""
+	acct.RefreshToken = ""
+	acct.APIKey = ""
+	if acct.Metadata != nil {
+		metadata := make(map[string]string, len(acct.Metadata))
+		for key, value := range acct.Metadata {
+			if key != "id_token" {
+				metadata[key] = value
+			}
+		}
+		acct.Metadata = metadata
+	}
+	return acct
 }
 
 // mapProviderTypeToOAuth maps provider type to OAuth config name
 func mapProviderTypeToOAuth(providerType string) string {
-	mapping := map[string]string{
-		"claude-cli":     "claude",
-		"anthropic-api":  "claude",
-		"codex-cli":      "codex",
-		"openai-api":     "codex",
-		"gemini-cli":     "gemini",
-		"gemini-api":     "gemini",
-		"antigravity":    "antigravity",
-		"github-copilot": "github",
-	}
-	if name, ok := mapping[providerType]; ok {
-		return name
-	}
-	return providerType
+	return auth.ProviderNameForType(providerType)
 }

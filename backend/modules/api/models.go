@@ -5,18 +5,19 @@ import "encoding/json"
 // OpenAI-compatible request/response types
 
 type ChatRequest struct {
-	Model    string          `json:"model"`
-	Messages []Message       `json:"messages"`
-	Stream   bool            `json:"stream"`
-	Tools    json.RawMessage `json:"tools,omitempty"`       // Tool definitions
-	ToolChoice json.RawMessage `json:"tool_choice,omitempty"` // Tool choice strategy
+	Model           string          `json:"model"`
+	Messages        []Message       `json:"messages"`
+	Stream          bool            `json:"stream"`
+	ReasoningEffort string          `json:"reasoning_effort,omitempty"`
+	Tools           json.RawMessage `json:"tools,omitempty"`       // Tool definitions
+	ToolChoice      json.RawMessage `json:"tool_choice,omitempty"` // Tool choice strategy
 }
 
 type Message struct {
-	Role       string          `json:"role"`
-	Content    any             `json:"content"`                // string or []ContentPart
-	ToolCalls  []ToolCall      `json:"tool_calls,omitempty"`   // assistant tool calls
-	ToolCallID string          `json:"tool_call_id,omitempty"` // tool response reference
+	Role       string     `json:"role"`
+	Content    any        `json:"content"`                // string or []ContentPart
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // assistant tool calls
+	ToolCallID string     `json:"tool_call_id,omitempty"` // tool response reference
 }
 
 type ContentPart struct {

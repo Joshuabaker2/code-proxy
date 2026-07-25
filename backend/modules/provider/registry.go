@@ -148,7 +148,7 @@ func parseModelPrefix(model string) (providerType, cleanModel string) {
 		"cli-codex/": "codex-cli",
 		"cli-gc/":    "gemini-cli",
 		// OAuth/API prefixes
-		"cc/":         "claude-cli",
+		"cc/":         "anthropic-api",
 		"cx/":         "codex-cli",
 		"codex/":      "codex-cli",
 		"gc/":         "gemini-cli",

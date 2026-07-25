@@ -104,6 +104,10 @@ func (m *Manager) RefreshLoop(ctx context.Context, interval time.Duration, refre
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	// Refresh immediately on startup so a persisted, nearly expired token does
+	// not fail requests during the first interval.
+	m.refreshExpiring(refreshFn)
+
 	for {
 		select {
 		case <-ctx.Done():

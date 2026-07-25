@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -11,10 +12,12 @@ import (
 	"code-proxy/embed"
 	"code-proxy/modules/account"
 	"code-proxy/modules/api"
+	"code-proxy/modules/auth"
 	"code-proxy/modules/config"
 	"code-proxy/modules/database"
 	"code-proxy/modules/provider"
 	"code-proxy/modules/tunnel"
+	"code-proxy/modules/zed"
 )
 
 func main() {
@@ -68,7 +71,35 @@ func main() {
 	// Background token refresh (every 5 minutes)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go acctMgr.RefreshLoop(ctx, 5*time.Minute, nil) // refreshFn is configured once OAuth is ready
+	go acctMgr.RefreshLoop(ctx, 5*time.Minute, func(acct *provider.Account) error {
+		if db == nil || acct.RefreshToken == "" {
+			return nil
+		}
+		oauthProvider := auth.ProviderNameForType(acct.ProviderType)
+		oauthConfig, ok := auth.GetConfig(oauthProvider)
+		if !ok {
+			return fmt.Errorf("OAuth config not found for %s", acct.ProviderType)
+		}
+		tokens, err := auth.RefreshTokens(oauthConfig, acct.RefreshToken)
+		if err != nil {
+			return err
+		}
+		expiresAt := tokens.ExpiresAt
+		return db.UpdateAccountTokens(acct.ID, tokens.AccessToken, tokens.RefreshToken, &expiresAt)
+	})
+
+	if os.Getenv("ZED_SYNC_MODELS") == "true" {
+		settingsPath := os.Getenv("ZED_SETTINGS_PATH")
+		if settingsPath == "" {
+			settingsPath, err = zed.DefaultSettingsPath()
+		}
+		if err != nil {
+			log.Printf("[ZED] Could not resolve settings path: %v", err)
+		} else {
+			syncZedModels(ctx, settingsPath, db)
+			go zedModelSyncLoop(ctx, settingsPath, db, 6*time.Hour)
+		}
+	}
 
 	// Tunnel manager
 	tunnelMgr := tunnel.NewManager(cfg.Port, cfg.DataDir, func(url string) {
@@ -123,7 +154,55 @@ func main() {
 	log.Println("[MAIN]   GET  /api/keys, /api/providers, /api/accounts, /api/settings, /api/logs, /api/stats")
 	log.Println("[MAIN]   POST /api/tunnel/enable, /api/tunnel/disable, /api/tunnel/status")
 
-	if err := http.ListenAndServe(":"+cfg.Port, server.Handler()); err != nil {
+	if err := http.ListenAndServe("127.0.0.1:"+cfg.Port, server.Handler()); err != nil {
 		log.Fatal(err)
+	}
+}
+
+func zedModelSyncLoop(ctx context.Context, settingsPath string, db *database.DB, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			syncZedModels(ctx, settingsPath, db)
+		}
+	}
+}
+
+func syncZedModels(ctx context.Context, settingsPath string, db *database.DB) {
+	models := provider.ClaudeOAuthModels()
+	if db != nil {
+		accounts, err := db.GetAvailableAccounts("anthropic-api")
+		if err != nil {
+			log.Printf("[ZED] Could not load Claude accounts for model discovery: %v", err)
+		} else {
+			for _, acct := range accounts {
+				if acct.AuthMode != "oauth" || acct.AccessToken == "" {
+					continue
+				}
+				discoveryCtx, cancelDiscovery := context.WithTimeout(ctx, 15*time.Second)
+				discovered, discoverErr := provider.DiscoverClaudeOAuthModels(discoveryCtx, acct.AccessToken)
+				cancelDiscovery()
+				if discoverErr != nil {
+					log.Printf("[ZED] Live Claude model discovery failed for one account: %v", discoverErr)
+					continue
+				}
+				models = discovered
+				log.Printf("[ZED] Discovered %d Claude models from Anthropic", len(models))
+				break
+			}
+		}
+	}
+
+	changed, err := zed.SyncCodeProxyModels(settingsPath, zed.CodeProxyModels(models))
+	if err != nil {
+		log.Printf("[ZED] Model sync skipped: %v", err)
+	} else if changed {
+		log.Printf("[ZED] Updated Code Proxy models in %s", settingsPath)
+	} else {
+		log.Printf("[ZED] Code Proxy models already current")
 	}
 }

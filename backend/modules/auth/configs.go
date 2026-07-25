@@ -10,8 +10,8 @@ type OAuthConfig struct {
 	TokenURL     string
 	Scopes       []string
 	CallbackPort int
-	CallbackPath string            // Callback path (default: "/auth/callback")
-	ContentType  string            // "application/json" or "application/x-www-form-urlencoded"
+	CallbackPath string // Callback path (default: "/auth/callback")
+	ContentType  string // "application/json" or "application/x-www-form-urlencoded"
 	UsePKCE      bool
 	ExtraParams  map[string]string // Additional authorization URL parameters
 }
@@ -104,6 +104,24 @@ var Configs = map[string]OAuthConfig{
 func GetConfig(providerName string) (OAuthConfig, bool) {
 	cfg, ok := Configs[providerName]
 	return cfg, ok
+}
+
+// ProviderNameForType maps a runtime provider type to its OAuth configuration.
+func ProviderNameForType(providerType string) string {
+	mapping := map[string]string{
+		"claude-cli":     "claude",
+		"anthropic-api":  "claude",
+		"codex-cli":      "codex",
+		"openai-api":     "codex",
+		"gemini-cli":     "gemini",
+		"gemini-api":     "gemini",
+		"antigravity":    "antigravity",
+		"github-copilot": "github",
+	}
+	if name, ok := mapping[providerType]; ok {
+		return name
+	}
+	return providerType
 }
 
 // ListOAuthProviders returns a list of providers that support OAuth

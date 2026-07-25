@@ -37,8 +37,12 @@ func handleChat(registry *provider.Registry, acctMgr *account.Manager, defaultMo
 			return
 		}
 
-		// Extract effort suffix (:low/:medium/:high) from model
+		// A model suffix remains supported for clients without a native effort
+		// control. Zed sends the selected value as reasoning_effort instead.
 		modelStr, effort := parseModelAndEffort(req.Model)
+		if effort == "" {
+			effort = normalizeEffort(req.ReasoningEffort)
+		}
 		if modelStr == "" {
 			modelStr = defaultModel
 		}
@@ -252,6 +256,7 @@ func streamResponse(w http.ResponseWriter, events <-chan provider.Event, model s
 	chatID := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	created := time.Now().Unix()
 	sentRole := false
+	sentFinish := false
 	var totalText int
 	var cost float64
 
@@ -275,6 +280,7 @@ func streamResponse(w http.ResponseWriter, events <-chan provider.Event, model s
 			fmt.Fprintf(w, "data: %s\n\n", event.JSON)
 			flusher.Flush()
 			sentRole = true
+			sentFinish = sentFinish || chunkHasFinishReason(event.JSON)
 			// Try to extract token count from the chunk
 			totalText += extractChunkTextLen(event.JSON)
 
@@ -291,10 +297,12 @@ func streamResponse(w http.ResponseWriter, events <-chan provider.Event, model s
 					Choices: []Choice{{Index: 0, Delta: &Delta{Role: "assistant"}}},
 				})
 			}
-			sendSSE(w, flusher, ChatResponse{
-				ID: chatID, Object: "chat.completion.chunk", Created: created, Model: originalModel,
-				Choices: []Choice{{Index: 0, Delta: &Delta{}, FinishReason: "stop"}},
-			})
+			if !sentFinish {
+				sendSSE(w, flusher, ChatResponse{
+					ID: chatID, Object: "chat.completion.chunk", Created: created, Model: originalModel,
+					Choices: []Choice{{Index: 0, Delta: &Delta{}, FinishReason: "stop"}},
+				})
+			}
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
 			return totalText / 4, cost
@@ -395,7 +403,7 @@ func writeError(w http.ResponseWriter, message string, status int) {
 	})
 }
 
-// parseModelAndEffort extracts effort suffix from model
+// parseModelAndEffort extracts an effort suffix from a model ID.
 // E.g. "cc/claude-opus-4-6:low" -> ("cc/claude-opus-4-6", "low")
 func parseModelAndEffort(m string) (string, string) {
 	m = strings.TrimSpace(m)
@@ -404,20 +412,34 @@ func parseModelAndEffort(m string) (string, string) {
 	}
 
 	if idx := strings.LastIndex(m, ":"); idx > 0 {
-		suffix := strings.ToLower(m[idx+1:])
-		switch suffix {
-		case "low":
-			return m[:idx], "low"
-		case "medium", "med":
-			return m[:idx], "medium"
-		case "high":
-			return m[:idx], "high"
-		case "max":
-			return m[:idx], "max"
+		if effort := normalizeEffort(m[idx+1:]); effort != "" {
+			return m[:idx], effort
 		}
 	}
 
 	return m, ""
+}
+
+func normalizeEffort(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "minimal":
+		// Anthropic has no "minimal" level. Low is its closest equivalent.
+		return "low"
+	case "low":
+		return "low"
+	case "medium", "med":
+		return "medium"
+	case "high":
+		return "high"
+	case "xhigh":
+		return "xhigh"
+	case "max":
+		return "max"
+	default:
+		// "none", an omitted value, and unknown OpenAI-specific levels mean
+		// that no Anthropic output_config.effort should be sent.
+		return ""
+	}
 }
 
 // estimateInputTokens estimates input tokens from request body size
@@ -438,4 +460,21 @@ func extractChunkTextLen(jsonStr string) int {
 		return len(chunk.Choices[0].Delta.Content)
 	}
 	return 0
+}
+
+func chunkHasFinishReason(jsonStr string) bool {
+	var chunk struct {
+		Choices []struct {
+			FinishReason *string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if json.Unmarshal([]byte(jsonStr), &chunk) != nil {
+		return false
+	}
+	for _, choice := range chunk.Choices {
+		if choice.FinishReason != nil && *choice.FinishReason != "" {
+			return true
+		}
+	}
+	return false
 }

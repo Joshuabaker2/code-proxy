@@ -19,7 +19,7 @@ type Event struct {
 type Request struct {
 	RawBody json.RawMessage // Complete OpenAI request (original JSON from client)
 	Model   string          // Resolved model (e.g. "sonnet", "gpt-4o")
-	Effort  string          // low/medium/high/max
+	Effort  string          // low/medium/high/xhigh/max
 	Stream  bool
 	Account *Account // Selected credentials (nil for providers without auth)
 }

@@ -32,7 +32,7 @@ const cliCatalog = [
 
 // OAuth Providers (subscription-based tokens via OAuth, like 9router)
 const oauthCatalog = [
-  { type: 'claude-cli', label: 'Claude Code', icon: '/providers/claude.png', color: '#D97757', textIcon: 'CC', desc: 'Claude Max subscription', auth: ['oauth'], oauthName: 'claude', prefix: 'cc', category: 'oauth' },
+  { type: 'claude-cli', accountType: 'anthropic-api', label: 'Claude Code', icon: '/providers/claude.png', color: '#D97757', textIcon: 'CC', desc: 'Claude Max subscription', auth: ['oauth'], oauthName: 'claude', prefix: 'cc', category: 'oauth' },
   { type: 'codex-cli', label: 'OpenAI Codex', icon: '/providers/codex.png', color: '#3B82F6', textIcon: 'CX', desc: 'Codex Pro subscription', auth: ['oauth'], oauthName: 'codex', prefix: 'codex', category: 'oauth' },
   { type: 'gemini-cli', label: 'Gemini CLI', icon: '/providers/gemini-cli.png', color: '#4285F4', textIcon: 'GC', desc: 'Google AI subscription', auth: ['oauth'], oauthName: 'gemini', prefix: 'gc', category: 'oauth' },
   { type: 'antigravity', label: 'Antigravity', icon: '/providers/antigravity.png', color: '#F59E0B', textIcon: 'AG', desc: 'Google Cloud Code', auth: ['oauth'], oauthName: 'antigravity', prefix: 'ag', category: 'oauth' },
@@ -77,7 +77,8 @@ function accountsForCatalog(catalogItem) {
     if (catalogItem.category === 'cli') return false
     // OAuth section: only show oauth accounts for this provider type
     if (catalogItem.category === 'oauth') {
-      return a.provider_type === catalogItem.type && a.auth_mode === 'oauth'
+      const accountType = catalogItem.accountType || catalogItem.type
+      return a.provider_type === accountType && a.auth_mode === 'oauth'
     }
     // API Key section
     if (catalogItem.providerSubtype) {

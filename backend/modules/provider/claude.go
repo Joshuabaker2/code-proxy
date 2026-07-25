@@ -19,11 +19,11 @@ func NewClaude(workDir string) *Claude {
 }
 
 func (c *Claude) Name() string      { return "claude" }
-func (c *Claude) Category() string   { return "cli" }
-func (c *Claude) IsAvailable() bool  { return CLIBinaryAvailable("claude") }
+func (c *Claude) Category() string  { return "cli" }
+func (c *Claude) IsAvailable() bool { return CLIBinaryAvailable("claude") }
 
 func (c *Claude) Models() []Model {
-	return []Model{
+	models := []Model{
 		// CLI models (local binary)
 		{ID: "cli-cc/claude-opus-4-6", Name: "Claude Opus 4.6", OwnedBy: "anthropic"},
 		{ID: "cli-cc/claude-opus-4-6:low", Name: "Claude Opus 4.6 (Low)", OwnedBy: "anthropic"},
@@ -34,17 +34,17 @@ func (c *Claude) Models() []Model {
 		{ID: "cli-cc/claude-sonnet-4-6:medium", Name: "Claude Sonnet 4.6 (Medium)", OwnedBy: "anthropic"},
 		{ID: "cli-cc/claude-sonnet-4-6:max", Name: "Claude Sonnet 4.6 (Max)", OwnedBy: "anthropic"},
 		{ID: "cli-cc/claude-haiku-4-5", Name: "Claude Haiku 4.5", OwnedBy: "anthropic"},
-		// OAuth models (subscription token)
-		{ID: "cc/claude-opus-4-6", Name: "Claude Opus 4.6", OwnedBy: "anthropic"},
-		{ID: "cc/claude-opus-4-6:low", Name: "Claude Opus 4.6 (Low)", OwnedBy: "anthropic"},
-		{ID: "cc/claude-opus-4-6:medium", Name: "Claude Opus 4.6 (Medium)", OwnedBy: "anthropic"},
-		{ID: "cc/claude-opus-4-6:max", Name: "Claude Opus 4.6 (Max)", OwnedBy: "anthropic"},
-		{ID: "cc/claude-sonnet-4-6", Name: "Claude Sonnet 4.6", OwnedBy: "anthropic"},
-		{ID: "cc/claude-sonnet-4-6:low", Name: "Claude Sonnet 4.6 (Low)", OwnedBy: "anthropic"},
-		{ID: "cc/claude-sonnet-4-6:medium", Name: "Claude Sonnet 4.6 (Medium)", OwnedBy: "anthropic"},
-		{ID: "cc/claude-sonnet-4-6:max", Name: "Claude Sonnet 4.6 (Max)", OwnedBy: "anthropic"},
-		{ID: "cc/claude-haiku-4-5", Name: "Claude Haiku 4.5", OwnedBy: "anthropic"},
 	}
+	models = append(models, ClaudeOAuthModels()...)
+	return append(models,
+		// OAuth effort aliases (subscription token)
+		Model{ID: "cc/claude-opus-4-6:low", Name: "Claude Opus 4.6 (Low)", OwnedBy: "anthropic"},
+		Model{ID: "cc/claude-opus-4-6:medium", Name: "Claude Opus 4.6 (Medium)", OwnedBy: "anthropic"},
+		Model{ID: "cc/claude-opus-4-6:max", Name: "Claude Opus 4.6 (Max)", OwnedBy: "anthropic"},
+		Model{ID: "cc/claude-sonnet-4-6:low", Name: "Claude Sonnet 4.6 (Low)", OwnedBy: "anthropic"},
+		Model{ID: "cc/claude-sonnet-4-6:medium", Name: "Claude Sonnet 4.6 (Medium)", OwnedBy: "anthropic"},
+		Model{ID: "cc/claude-sonnet-4-6:max", Name: "Claude Sonnet 4.6 (Max)", OwnedBy: "anthropic"},
+	)
 }
 
 // Execute implements Provider.Execute — spawns claude CLI with stream-json output
@@ -373,9 +373,9 @@ func formatToolUse(name string, input json.RawMessage) string {
 
 	case "Grep":
 		var inp struct {
-			Pattern    string `json:"pattern"`
-			Path       string `json:"path"`
-			Glob       string `json:"glob"`
+			Pattern string `json:"pattern"`
+			Path    string `json:"path"`
+			Glob    string `json:"glob"`
 		}
 		if json.Unmarshal(input, &inp) == nil && inp.Pattern != "" {
 			path := shortPath(inp.Path)
