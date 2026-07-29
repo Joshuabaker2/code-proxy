@@ -56,7 +56,9 @@ function timeAgo(t) {
 function effortBadge(effort) {
   const light = props.theme === 'light'
   switch (effort) {
-    case 'high': return { text: 'MAX', cls: light ? 'bg-red-100 text-red-700' : 'bg-red-400/10 text-red-400' }
+    case 'max': return { text: 'MAX', cls: light ? 'bg-red-100 text-red-700' : 'bg-red-400/10 text-red-400' }
+    case 'xhigh': return { text: 'XHIGH', cls: light ? 'bg-orange-100 text-orange-700' : 'bg-orange-400/10 text-orange-400' }
+    case 'high': return { text: 'HIGH', cls: light ? 'bg-purple-100 text-purple-700' : 'bg-purple-400/10 text-purple-400' }
     case 'medium': return { text: 'MED', cls: light ? 'bg-yellow-100 text-yellow-700' : 'bg-yellow-400/10 text-yellow-400' }
     case 'low': return { text: 'LOW', cls: light ? 'bg-green-100 text-green-700' : 'bg-green-400/10 text-green-400' }
     default: return { text: '-', cls: 'text-gray-600' }
@@ -98,6 +100,10 @@ onMounted(load)
             <th class="text-right px-4 py-3 text-xs uppercase tracking-wider font-medium"
                 :class="props.theme === 'light' ? 'text-gray-400' : 'text-gray-500'">Out</th>
             <th class="text-right px-4 py-3 text-xs uppercase tracking-wider font-medium"
+                :class="props.theme === 'light' ? 'text-gray-400' : 'text-gray-500'">Cache write</th>
+            <th class="text-right px-4 py-3 text-xs uppercase tracking-wider font-medium"
+                :class="props.theme === 'light' ? 'text-gray-400' : 'text-gray-500'">Cache read</th>
+            <th class="text-right px-4 py-3 text-xs uppercase tracking-wider font-medium"
                 :class="props.theme === 'light' ? 'text-gray-400' : 'text-gray-500'">Duration</th>
             <th class="text-left px-4 py-3 text-xs uppercase tracking-wider font-medium"
                 :class="props.theme === 'light' ? 'text-gray-400' : 'text-gray-500'">Key</th>
@@ -107,11 +113,11 @@ onMounted(load)
         </thead>
         <tbody>
           <tr v-if="loading">
-            <td colspan="7" class="px-4 py-8 text-center text-xs"
+            <td colspan="9" class="px-4 py-8 text-center text-xs"
                 :class="props.theme === 'light' ? 'text-gray-400' : 'text-gray-500'">Loading...</td>
           </tr>
           <tr v-else-if="logs.length === 0">
-            <td colspan="7" class="px-4 py-8 text-center text-xs"
+            <td colspan="9" class="px-4 py-8 text-center text-xs"
                 :class="props.theme === 'light' ? 'text-gray-400' : 'text-gray-500'">No logs recorded</td>
           </tr>
           <tr v-for="log in logs" :key="log.id"
@@ -133,6 +139,12 @@ onMounted(load)
             </td>
             <td class="px-4 py-2.5 text-right">
               <span class="text-green-400 text-xs font-mono">{{ fmtNum(log.output_tokens) }}</span>
+            </td>
+            <td class="px-4 py-2.5 text-right">
+              <span class="text-orange-400 text-xs font-mono">{{ fmtNum(log.cache_creation_input_tokens) }}</span>
+            </td>
+            <td class="px-4 py-2.5 text-right">
+              <span class="text-cyan-400 text-xs font-mono">{{ fmtNum(log.cache_read_input_tokens) }}</span>
             </td>
             <td class="px-4 py-2.5 text-right text-xs font-mono"
                 :class="props.theme === 'light' ? 'text-gray-500' : 'text-gray-400'">{{ formatDuration(log.duration_ms) }}</td>

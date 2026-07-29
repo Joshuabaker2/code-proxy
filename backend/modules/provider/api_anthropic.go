@@ -13,6 +13,8 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 )
 
 const anthropicBaseURL = "https://api.anthropic.com"
@@ -20,12 +22,25 @@ const anthropicVersion = "2023-06-01"
 const claudeCodeVersion = "2.1.219"
 const claudeCodeBillingVersion = "2.1.219.526"
 
+const anthropicThinkingReplayTTL = time.Hour
+
+type cachedAnthropicThinking struct {
+	model     string
+	blocks    []map[string]any
+	createdAt time.Time
+}
+
 // AnthropicAPI is the provider for the Anthropic Messages API with format translation
-type AnthropicAPI struct{}
+type AnthropicAPI struct {
+	thinkingMu         sync.Mutex
+	thinkingByToolCall map[string]cachedAnthropicThinking
+}
 
 // NewAnthropicAPI creates an Anthropic API provider
 func NewAnthropicAPI() *AnthropicAPI {
-	return &AnthropicAPI{}
+	return &AnthropicAPI{
+		thinkingByToolCall: make(map[string]cachedAnthropicThinking),
+	}
 }
 
 func (p *AnthropicAPI) Name() string      { return "anthropic-api" }
@@ -79,8 +94,10 @@ func DiscoverClaudeOAuthModels(ctx context.Context, accessToken string) ([]Model
 func parseClaudeOAuthModels(body []byte) ([]Model, error) {
 	var response struct {
 		Data []struct {
-			ID          string `json:"id"`
-			DisplayName string `json:"display_name"`
+			ID             string `json:"id"`
+			DisplayName    string `json:"display_name"`
+			MaxInputTokens *int   `json:"max_input_tokens"`
+			MaxTokens      *int   `json:"max_tokens"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &response); err != nil {
@@ -96,10 +113,19 @@ func parseClaudeOAuthModels(body []byte) ([]Model, error) {
 		if name == "" {
 			name = item.ID
 		}
+		maxInputTokens, maxOutputTokens := ClaudeModelLimits(item.ID)
+		if item.MaxInputTokens != nil && *item.MaxInputTokens > 0 {
+			maxInputTokens = *item.MaxInputTokens
+		}
+		if item.MaxTokens != nil && *item.MaxTokens > 0 {
+			maxOutputTokens = *item.MaxTokens
+		}
 		models = append(models, Model{
-			ID:      "cc/" + item.ID,
-			Name:    name,
-			OwnedBy: "anthropic",
+			ID:              "cc/" + item.ID,
+			Name:            name,
+			OwnedBy:         "anthropic",
+			MaxInputTokens:  maxInputTokens,
+			MaxOutputTokens: maxOutputTokens,
 		})
 	}
 	if len(models) == 0 {
@@ -114,7 +140,11 @@ func (p *AnthropicAPI) Execute(ctx context.Context, req *Request) (<-chan Event,
 	}
 
 	// Translate request OpenAI -> Claude Messages API
-	claudeBody, _, err := TranslateOpenAIToAnthropic(req.RawBody, req.Model)
+	claudeBody, _, err := translateOpenAIToAnthropic(
+		req.RawBody,
+		req.Model,
+		p.replayThinkingBlocks,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("translate to anthropic: %w", err)
 	}
@@ -174,14 +204,91 @@ func (p *AnthropicAPI) Execute(ctx context.Context, req *Request) (<-chan Event,
 	}
 
 	events := make(chan Event, 128)
+	anthropicModel := mapModelToAnthropic(req.Model)
 
 	if req.Stream {
-		go p.streamResponse(resp, events)
+		go p.streamResponse(resp, events, anthropicModel)
 	} else {
-		go p.nonStreamResponse(resp, events)
+		go p.nonStreamResponse(resp, events, anthropicModel)
 	}
 
 	return events, nil
+}
+
+func (p *AnthropicAPI) rememberThinkingBlocks(
+	toolCallIDs []string,
+	model string,
+	blocks []map[string]any,
+) {
+	if len(toolCallIDs) == 0 || len(blocks) == 0 {
+		return
+	}
+
+	now := time.Now()
+	p.thinkingMu.Lock()
+	defer p.thinkingMu.Unlock()
+	if p.thinkingByToolCall == nil {
+		p.thinkingByToolCall = make(map[string]cachedAnthropicThinking)
+	}
+	for id, cached := range p.thinkingByToolCall {
+		if now.Sub(cached.createdAt) > anthropicThinkingReplayTTL {
+			delete(p.thinkingByToolCall, id)
+		}
+	}
+
+	cached := cachedAnthropicThinking{
+		model:     model,
+		blocks:    cloneAnthropicBlocks(blocks),
+		createdAt: now,
+	}
+	for _, id := range toolCallIDs {
+		if id != "" {
+			p.thinkingByToolCall[id] = cached
+		}
+	}
+}
+
+func (p *AnthropicAPI) replayThinkingBlocks(
+	rawToolCalls json.RawMessage,
+	model string,
+) []map[string]any {
+	var calls []struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(rawToolCalls, &calls) != nil {
+		return nil
+	}
+
+	now := time.Now()
+	p.thinkingMu.Lock()
+	defer p.thinkingMu.Unlock()
+	for id, cached := range p.thinkingByToolCall {
+		if now.Sub(cached.createdAt) > anthropicThinkingReplayTTL {
+			delete(p.thinkingByToolCall, id)
+			continue
+		}
+		if cached.model != model {
+			continue
+		}
+		for _, call := range calls {
+			if call.ID == id {
+				return cloneAnthropicBlocks(cached.blocks)
+			}
+		}
+	}
+	return nil
+}
+
+func cloneAnthropicBlocks(blocks []map[string]any) []map[string]any {
+	cloned := make([]map[string]any, 0, len(blocks))
+	for _, block := range blocks {
+		copyBlock := make(map[string]any, len(block))
+		for key, value := range block {
+			copyBlock[key] = value
+		}
+		cloned = append(cloned, copyBlock)
+	}
+	return cloned
 }
 
 func applyAnthropicEffort(body []byte, effort string) ([]byte, error) {
@@ -287,8 +394,236 @@ func formatUUID(raw []byte) string {
 		value[0:4], value[4:6], value[6:8], value[8:10], value[10:16])
 }
 
+type anthropicStreamUsage struct {
+	inputTokens              int
+	cacheCreationInputTokens int
+	cacheReadInputTokens     int
+	outputTokens             int
+	model                    string
+	seen                     bool
+}
+
+type anthropicUsageFields struct {
+	InputTokens              *int `json:"input_tokens"`
+	CacheCreationInputTokens *int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     *int `json:"cache_read_input_tokens"`
+	OutputTokens             *int `json:"output_tokens"`
+}
+
+func (u *anthropicStreamUsage) observe(data []byte) {
+	var event struct {
+		Type    string `json:"type"`
+		Message *struct {
+			Model string                `json:"model"`
+			Usage *anthropicUsageFields `json:"usage"`
+		} `json:"message,omitempty"`
+		Usage *anthropicUsageFields `json:"usage,omitempty"`
+	}
+	if json.Unmarshal(data, &event) != nil {
+		return
+	}
+
+	if event.Message != nil {
+		if event.Message.Model != "" {
+			u.model = event.Message.Model
+		}
+		u.update(event.Message.Usage)
+	}
+	u.update(event.Usage)
+}
+
+func (u *anthropicStreamUsage) update(usage *anthropicUsageFields) {
+	if usage == nil {
+		return
+	}
+	u.seen = true
+	if usage.InputTokens != nil {
+		u.inputTokens = *usage.InputTokens
+	}
+	if usage.CacheCreationInputTokens != nil {
+		u.cacheCreationInputTokens = *usage.CacheCreationInputTokens
+	}
+	if usage.CacheReadInputTokens != nil {
+		u.cacheReadInputTokens = *usage.CacheReadInputTokens
+	}
+	if usage.OutputTokens != nil {
+		// Anthropic reports cumulative output usage in message_delta events.
+		u.outputTokens = *usage.OutputTokens
+	}
+}
+
+func (u anthropicStreamUsage) openAIChunk(chatID string) ([]byte, error) {
+	promptTokens := u.inputTokens + u.cacheCreationInputTokens + u.cacheReadInputTokens
+	chunk := map[string]any{
+		"id":      chatID,
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   u.model,
+		"choices": []any{},
+		"usage": map[string]any{
+			"prompt_tokens":     promptTokens,
+			"completion_tokens": u.outputTokens,
+			"total_tokens":      promptTokens + u.outputTokens,
+			"prompt_tokens_details": map[string]any{
+				"cached_tokens":         u.cacheReadInputTokens,
+				"cache_creation_tokens": u.cacheCreationInputTokens,
+			},
+		},
+	}
+	return json.Marshal(chunk)
+}
+
+func parseAnthropicStreamError(data []byte) (string, bool) {
+	var event struct {
+		Type  string `json:"type"`
+		Error *struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error,omitempty"`
+		RequestID string `json:"request_id,omitempty"`
+	}
+	if json.Unmarshal(data, &event) != nil || event.Type != "error" {
+		return "", false
+	}
+
+	errorType := "stream_error"
+	message := "Anthropic stream failed"
+	if event.Error != nil {
+		if event.Error.Type != "" {
+			errorType = event.Error.Type
+		}
+		if event.Error.Message != "" {
+			message = event.Error.Message
+		}
+	}
+
+	text := fmt.Sprintf("Anthropic %s: %s", errorType, message)
+	if event.RequestID != "" {
+		text += fmt.Sprintf(" (request_id: %s)", event.RequestID)
+	}
+	return text, true
+}
+
+type anthropicThinkingBlock struct {
+	blockType string
+	thinking  string
+	signature string
+	data      string
+}
+
+func (b anthropicThinkingBlock) apiBlock() map[string]any {
+	switch b.blockType {
+	case "thinking":
+		if b.signature == "" {
+			return nil
+		}
+		return map[string]any{
+			"type":      "thinking",
+			"thinking":  b.thinking,
+			"signature": b.signature,
+		}
+	case "redacted_thinking":
+		if b.data == "" {
+			return nil
+		}
+		return map[string]any{
+			"type": "redacted_thinking",
+			"data": b.data,
+		}
+	default:
+		return nil
+	}
+}
+
+type anthropicThinkingTracker struct {
+	api      *AnthropicAPI
+	model    string
+	active   map[int]*anthropicThinkingBlock
+	finished []map[string]any
+}
+
+func newAnthropicThinkingTracker(api *AnthropicAPI, model string) *anthropicThinkingTracker {
+	return &anthropicThinkingTracker{
+		api:    api,
+		model:  model,
+		active: make(map[int]*anthropicThinkingBlock),
+	}
+}
+
+func (t *anthropicThinkingTracker) observe(data []byte) {
+	var event struct {
+		Type         string `json:"type"`
+		Index        int    `json:"index"`
+		ContentBlock *struct {
+			Type      string `json:"type"`
+			ID        string `json:"id,omitempty"`
+			Thinking  string `json:"thinking,omitempty"`
+			Signature string `json:"signature,omitempty"`
+			Data      string `json:"data,omitempty"`
+		} `json:"content_block,omitempty"`
+		Delta *struct {
+			Type      string `json:"type"`
+			Thinking  string `json:"thinking,omitempty"`
+			Signature string `json:"signature,omitempty"`
+		} `json:"delta,omitempty"`
+	}
+	if json.Unmarshal(data, &event) != nil {
+		return
+	}
+
+	switch event.Type {
+	case "content_block_start":
+		if event.ContentBlock == nil {
+			return
+		}
+		switch event.ContentBlock.Type {
+		case "thinking", "redacted_thinking":
+			t.active[event.Index] = &anthropicThinkingBlock{
+				blockType: event.ContentBlock.Type,
+				thinking:  event.ContentBlock.Thinking,
+				signature: event.ContentBlock.Signature,
+				data:      event.ContentBlock.Data,
+			}
+		case "tool_use":
+			if event.ContentBlock.ID != "" {
+				t.api.rememberThinkingBlocks(
+					[]string{event.ContentBlock.ID},
+					t.model,
+					t.finished,
+				)
+			}
+		}
+
+	case "content_block_delta":
+		block := t.active[event.Index]
+		if block == nil || event.Delta == nil {
+			return
+		}
+		switch event.Delta.Type {
+		case "thinking_delta":
+			block.thinking += event.Delta.Thinking
+		case "signature_delta":
+			block.signature += event.Delta.Signature
+		}
+
+	case "content_block_stop":
+		block := t.active[event.Index]
+		if block == nil {
+			return
+		}
+		if apiBlock := block.apiBlock(); apiBlock != nil {
+			t.finished = append(t.finished, apiBlock)
+		}
+		delete(t.active, event.Index)
+	}
+}
+
 // streamResponse reads Claude SSE and translates to OpenAI format
-func (p *AnthropicAPI) streamResponse(resp *http.Response, events chan<- Event) {
+func (p *AnthropicAPI) streamResponse(
+	resp *http.Response,
+	events chan<- Event,
+	model string,
+) {
 	defer close(events)
 	defer resp.Body.Close()
 
@@ -298,6 +633,9 @@ func (p *AnthropicAPI) streamResponse(resp *http.Response, events chan<- Event) 
 	var eventType string
 	var chatID string
 	toolIndexes := make(map[int]int)
+	var usage anthropicStreamUsage
+	thinking := newAnthropicThinkingTracker(p, model)
+	var streamError string
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -332,6 +670,14 @@ func (p *AnthropicAPI) streamResponse(resp *http.Response, events chan<- Event) 
 			eventType = ""
 		}
 
+		usage.observe([]byte(data))
+		thinking.observe([]byte(data))
+
+		if message, ok := parseAnthropicStreamError([]byte(data)); ok {
+			streamError = message
+			break
+		}
+
 		// Translate to OpenAI
 		translated, err := TranslateAnthropicStreamToOpenAI([]byte(data))
 		if err != nil {
@@ -345,8 +691,25 @@ func (p *AnthropicAPI) streamResponse(resp *http.Response, events chan<- Event) 
 	}
 
 	if err := scanner.Err(); err != nil {
-		log.Printf("[ANTHROPIC] Stream scan error: %v", err)
-		events <- Event{Type: "error", Text: err.Error()}
+		streamError = fmt.Sprintf("Anthropic stream read failed: %v", err)
+	}
+
+	if usage.seen {
+		if chatID == "" {
+			chatID = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+		}
+		translated, err := usage.openAIChunk(chatID)
+		if err != nil {
+			log.Printf("[ANTHROPIC] Usage translation error: %v", err)
+		} else {
+			events <- Event{Type: "sse_chunk", JSON: string(translated)}
+		}
+	}
+
+	if streamError != "" {
+		log.Printf("[ANTHROPIC] Stream error: %s", streamError)
+		events <- Event{Type: "error", Text: streamError}
+		return
 	}
 
 	events <- Event{Type: "done"}
@@ -393,7 +756,11 @@ func normalizeAnthropicOpenAIChunk(chunk []byte, chatID string, toolIndexes map[
 }
 
 // nonStreamResponse reads the full response and translates it
-func (p *AnthropicAPI) nonStreamResponse(resp *http.Response, events chan<- Event) {
+func (p *AnthropicAPI) nonStreamResponse(
+	resp *http.Response,
+	events chan<- Event,
+	model string,
+) {
 	defer close(events)
 	defer resp.Body.Close()
 
@@ -402,6 +769,7 @@ func (p *AnthropicAPI) nonStreamResponse(resp *http.Response, events chan<- Even
 		events <- Event{Type: "error", Text: err.Error()}
 		return
 	}
+	p.rememberNonStreamThinking(body, model)
 
 	translated, err := TranslateAnthropicResponseToOpenAI(body)
 	if err != nil {
@@ -418,4 +786,41 @@ func (p *AnthropicAPI) nonStreamResponse(resp *http.Response, events chan<- Even
 	events <- Event{Type: "sse_chunk", JSON: string(translated)}
 
 	events <- Event{Type: "done"}
+}
+
+func (p *AnthropicAPI) rememberNonStreamThinking(body []byte, model string) {
+	var response struct {
+		Content []struct {
+			Type      string `json:"type"`
+			ID        string `json:"id,omitempty"`
+			Thinking  string `json:"thinking,omitempty"`
+			Signature string `json:"signature,omitempty"`
+			Data      string `json:"data,omitempty"`
+		} `json:"content"`
+	}
+	if json.Unmarshal(body, &response) != nil {
+		return
+	}
+
+	var thinkingBlocks []map[string]any
+	var toolCallIDs []string
+	for _, block := range response.Content {
+		switch block.Type {
+		case "thinking", "redacted_thinking":
+			apiBlock := (anthropicThinkingBlock{
+				blockType: block.Type,
+				thinking:  block.Thinking,
+				signature: block.Signature,
+				data:      block.Data,
+			}).apiBlock()
+			if apiBlock != nil {
+				thinkingBlocks = append(thinkingBlocks, apiBlock)
+			}
+		case "tool_use":
+			if block.ID != "" {
+				toolCallIDs = append(toolCallIDs, block.ID)
+			}
+		}
+	}
+	p.rememberThinkingBlocks(toolCallIDs, model, thinkingBlocks)
 }

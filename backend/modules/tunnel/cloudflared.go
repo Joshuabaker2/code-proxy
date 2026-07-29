@@ -1,7 +1,10 @@
 package tunnel
 
 import (
+	"archive/tar"
 	"bufio"
+	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -225,7 +228,9 @@ func (m *Manager) AutoStart(tunnelEnabled bool, savedToken string) {
 }
 
 func (m *Manager) ensureBinary() (string, error) {
-	os.MkdirAll(m.binDir, 0755)
+	if err := os.MkdirAll(m.binDir, 0755); err != nil {
+		return "", fmt.Errorf("create bin directory: %w", err)
+	}
 
 	name := "cloudflared"
 	if runtime.GOOS == "windows" {
@@ -234,21 +239,27 @@ func (m *Manager) ensureBinary() (string, error) {
 	binPath := filepath.Join(m.binDir, name)
 
 	if _, err := os.Stat(binPath); err == nil {
-		return binPath, nil
+		if err := validateCloudflared(binPath); err == nil {
+			return binPath, nil
+		} else {
+			log.Printf("[TUNNEL] Replacing invalid cloudflared at %s: %v", binPath, err)
+		}
 	}
 
 	if path, err := exec.LookPath("cloudflared"); err == nil {
-		return path, nil
+		if err := validateCloudflared(path); err == nil {
+			return path, nil
+		}
 	}
 
-	url := cloudflaredDownloadURL()
-	if url == "" {
+	asset, ok := cloudflaredDownloadAsset(runtime.GOOS, runtime.GOARCH)
+	if !ok {
 		return "", fmt.Errorf("unsupported platform: %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
 
-	log.Printf("[TUNNEL] Downloading cloudflared from %s", url)
+	log.Printf("[TUNNEL] Downloading cloudflared from %s", asset.url)
 
-	resp, err := http.Get(url)
+	resp, err := http.Get(asset.url)
 	if err != nil {
 		return "", fmt.Errorf("download: %w", err)
 	}
@@ -258,47 +269,127 @@ func (m *Manager) ensureBinary() (string, error) {
 		return "", fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
 	}
 
-	f, err := os.Create(binPath)
+	tempPattern := ".cloudflared-*"
+	if runtime.GOOS == "windows" {
+		tempPattern += ".exe"
+	}
+	temp, err := os.CreateTemp(m.binDir, tempPattern)
 	if err != nil {
-		return "", fmt.Errorf("create file: %w", err)
+		return "", fmt.Errorf("create temporary file: %w", err)
 	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
 
-	buf := make([]byte, 32*1024)
-	for {
-		n, readErr := resp.Body.Read(buf)
-		if n > 0 {
-			f.Write(buf[:n])
-		}
-		if readErr != nil {
-			break
-		}
+	if err := copyCloudflaredPayload(temp, resp.Body, asset.archive); err != nil {
+		temp.Close()
+		return "", fmt.Errorf("extract download: %w", err)
 	}
-	f.Close()
 
 	if runtime.GOOS != "windows" {
-		os.Chmod(binPath, 0755)
+		if err := temp.Chmod(0755); err != nil {
+			temp.Close()
+			return "", fmt.Errorf("make executable: %w", err)
+		}
+	}
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		return "", fmt.Errorf("sync download: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return "", fmt.Errorf("close download: %w", err)
+	}
+	if err := validateCloudflared(tempPath); err != nil {
+		return "", fmt.Errorf("validate download: %w", err)
+	}
+
+	if runtime.GOOS == "windows" {
+		// Windows cannot atomically replace an existing executable.
+		if err := os.Remove(binPath); err != nil && !os.IsNotExist(err) {
+			return "", fmt.Errorf("remove invalid binary: %w", err)
+		}
+	}
+	if err := os.Rename(tempPath, binPath); err != nil {
+		return "", fmt.Errorf("install binary: %w", err)
 	}
 
 	log.Printf("[TUNNEL] Downloaded cloudflared to %s", binPath)
 	return binPath, nil
 }
 
-func cloudflaredDownloadURL() string {
+type cloudflaredAsset struct {
+	url     string
+	archive bool
+}
+
+func cloudflaredDownloadAsset(goos, goarch string) (cloudflaredAsset, bool) {
 	base := "https://github.com/cloudflare/cloudflared/releases/latest/download/"
-	goos := runtime.GOOS
-	goarch := runtime.GOARCH
 
 	switch {
 	case goos == "linux" && goarch == "amd64":
-		return base + "cloudflared-linux-amd64"
+		return cloudflaredAsset{url: base + "cloudflared-linux-amd64"}, true
 	case goos == "linux" && goarch == "arm64":
-		return base + "cloudflared-linux-arm64"
-	case goos == "darwin" && (goarch == "amd64" || goarch == "arm64"):
-		return base + "cloudflared-darwin-amd64.tgz"
+		return cloudflaredAsset{url: base + "cloudflared-linux-arm64"}, true
+	case goos == "darwin" && goarch == "amd64":
+		return cloudflaredAsset{
+			url:     base + "cloudflared-darwin-amd64.tgz",
+			archive: true,
+		}, true
+	case goos == "darwin" && goarch == "arm64":
+		return cloudflaredAsset{
+			url:     base + "cloudflared-darwin-arm64.tgz",
+			archive: true,
+		}, true
 	case goos == "windows" && goarch == "amd64":
-		return base + "cloudflared-windows-amd64.exe"
+		return cloudflaredAsset{url: base + "cloudflared-windows-amd64.exe"}, true
 	}
-	return ""
+	return cloudflaredAsset{}, false
+}
+
+func copyCloudflaredPayload(dst io.Writer, src io.Reader, archive bool) error {
+	if !archive {
+		_, err := io.Copy(dst, src)
+		return err
+	}
+
+	gzipReader, err := gzip.NewReader(src)
+	if err != nil {
+		return fmt.Errorf("open gzip archive: %w", err)
+	}
+	defer gzipReader.Close()
+
+	tarReader := tar.NewReader(gzipReader)
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			return fmt.Errorf("cloudflared executable not found in archive")
+		}
+		if err != nil {
+			return fmt.Errorf("read tar archive: %w", err)
+		}
+		isRegular := header.Typeflag == tar.TypeReg || header.Typeflag == tar.TypeRegA
+		if !isRegular || filepath.Base(header.Name) != "cloudflared" {
+			continue
+		}
+		_, err = io.Copy(dst, tarReader)
+		return err
+	}
+}
+
+func validateCloudflared(path string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	output, err := exec.CommandContext(ctx, path, "--version").CombinedOutput()
+	if ctx.Err() != nil {
+		return fmt.Errorf("version check timed out")
+	}
+	if err != nil {
+		return fmt.Errorf("version check: %w", err)
+	}
+	if !strings.Contains(strings.ToLower(string(output)), "cloudflared version") {
+		return fmt.Errorf("unexpected version output: %.120s", strings.TrimSpace(string(output)))
+	}
+	return nil
 }
 
 // RegisterRoutes adds tunnel API endpoints. onSaveToken persists token to DB.

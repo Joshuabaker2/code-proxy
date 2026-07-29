@@ -64,8 +64,12 @@ func (db *DB) migrate() error {
 			provider TEXT,
 			model TEXT,
 			effort TEXT,
+			account_id TEXT DEFAULT '',
 			input_tokens INTEGER DEFAULT 0,
 			output_tokens INTEGER DEFAULT 0,
+			cache_creation_input_tokens INTEGER DEFAULT 0,
+			cache_read_input_tokens INTEGER DEFAULT 0,
+			estimated_cost REAL DEFAULT 0,
 			duration_ms INTEGER DEFAULT 0,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		)`,
@@ -78,6 +82,8 @@ func (db *DB) migrate() error {
 		`ALTER TABLE api_keys ADD COLUMN key_raw TEXT DEFAULT ''`,
 		`ALTER TABLE request_logs ADD COLUMN account_id TEXT DEFAULT ''`,
 		`ALTER TABLE request_logs ADD COLUMN estimated_cost REAL DEFAULT 0`,
+		`ALTER TABLE request_logs ADD COLUMN cache_creation_input_tokens INTEGER DEFAULT 0`,
+		`ALTER TABLE request_logs ADD COLUMN cache_read_input_tokens INTEGER DEFAULT 0`,
 	}
 	for _, m := range alterMigrations {
 		db.conn.Exec(m) // Ignore errors (column already exists)
@@ -396,10 +402,21 @@ func (db *DB) ValidateDashboardSession(token string) bool {
 
 // --- Request Logs ---
 
-func (db *DB) LogRequest(apiKeyID, providerType, model, effort, accountID string, inputTokens, outputTokens int, estimatedCost float64, durationMs int64) {
+func (db *DB) LogRequest(
+	apiKeyID, providerType, model, effort, accountID string,
+	inputTokens, outputTokens, cacheCreationInputTokens, cacheReadInputTokens int,
+	estimatedCost float64,
+	durationMs int64,
+) {
 	db.conn.Exec(
-		`INSERT INTO request_logs (api_key_id, provider, model, effort, account_id, input_tokens, output_tokens, estimated_cost, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		apiKeyID, providerType, model, effort, accountID, inputTokens, outputTokens, estimatedCost, durationMs,
+		`INSERT INTO request_logs (
+			api_key_id, provider, model, effort, account_id,
+			input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+			estimated_cost, duration_ms
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		apiKeyID, providerType, model, effort, accountID,
+		inputTokens, outputTokens, cacheCreationInputTokens, cacheReadInputTokens,
+		estimatedCost, durationMs,
 	)
 }
 
@@ -410,6 +427,7 @@ func (db *DB) ListLogs(limit, offset int) ([]RequestLog, int, error) {
 	rows, err := db.conn.Query(`
 		SELECT l.id, l.api_key_id, COALESCE(k.name, 'unknown'), l.provider, l.model, l.effort,
 			   COALESCE(l.account_id, ''), l.input_tokens, l.output_tokens,
+			   COALESCE(l.cache_creation_input_tokens, 0), COALESCE(l.cache_read_input_tokens, 0),
 			   COALESCE(l.estimated_cost, 0), l.duration_ms, l.created_at
 		FROM request_logs l
 		LEFT JOIN api_keys k ON l.api_key_id = k.id
@@ -425,7 +443,9 @@ func (db *DB) ListLogs(limit, offset int) ([]RequestLog, int, error) {
 	for rows.Next() {
 		var l RequestLog
 		if err := rows.Scan(&l.ID, &l.ApiKeyID, &l.ApiKeyName, &l.Provider, &l.Model, &l.Effort,
-			&l.AccountID, &l.InputTokens, &l.OutputTokens, &l.EstimatedCost, &l.DurationMs, &l.CreatedAt); err != nil {
+			&l.AccountID, &l.InputTokens, &l.OutputTokens,
+			&l.CacheCreationInputTokens, &l.CacheReadInputTokens,
+			&l.EstimatedCost, &l.DurationMs, &l.CreatedAt); err != nil {
 			return nil, 0, err
 		}
 		logs = append(logs, l)

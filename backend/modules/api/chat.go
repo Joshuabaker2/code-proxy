@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -120,8 +121,12 @@ func executeSingleModelForCombo(w http.ResponseWriter, r *http.Request, body []b
 
 		events, err := p.Execute(r.Context(), provReq)
 		if err != nil {
+			status := providerErrorStatus(err)
 			if acct != nil {
-				acctMgr.ReportError(acct.ID, cleanModel, 500, err.Error())
+				acctMgr.ReportError(acct.ID, cleanModel, status, err.Error())
+			}
+			if status >= 400 && status < 500 {
+				return err
 			}
 			continue
 		}
@@ -136,21 +141,28 @@ func executeSingleModelForCombo(w http.ResponseWriter, r *http.Request, body []b
 			accountID = acct.ID
 		}
 
-		var outputTokens int
+		var tokenUsage requestTokenUsage
 		var cost float64
 		if req.Stream {
-			outputTokens, cost = streamResponse(w, events, cleanModel, req.Model)
+			tokenUsage, cost = streamResponse(w, events, cleanModel, req.Model)
 		} else {
-			outputTokens, cost = nonStreamResponse(w, events, cleanModel, req.Model)
+			tokenUsage, cost = nonStreamResponse(w, events, cleanModel, req.Model)
 		}
+		tokenUsage = tokenUsage.forLogging(inputTokens)
 
 		if db != nil {
 			durationMs := time.Since(startTime).Milliseconds()
 			if cost == 0 {
 				inRate, outRate := database.ModelCostRates(cleanModel)
-				cost = float64(inputTokens)/1_000_000*inRate + float64(outputTokens)/1_000_000*outRate
+				cost = float64(tokenUsage.InputTokens)/1_000_000*inRate +
+					float64(tokenUsage.OutputTokens)/1_000_000*outRate
 			}
-			db.LogRequest(apiKeyID, providerType, cleanModel, effort, accountID, inputTokens, outputTokens, cost, durationMs)
+			db.LogRequest(
+				apiKeyID, providerType, cleanModel, effort, accountID,
+				tokenUsage.InputTokens, tokenUsage.OutputTokens,
+				tokenUsage.CacheCreationInputTokens, tokenUsage.CacheReadInputTokens,
+				cost, durationMs,
+			)
 		}
 		return nil
 	}
@@ -177,6 +189,7 @@ func executeSingleModel(w http.ResponseWriter, r *http.Request, body []byte, req
 	inputTokens := estimateInputTokens(body)
 
 	var lastErr error
+	lastStatus := http.StatusInternalServerError
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		acct, err := acctMgr.Select(providerType, model)
 		if err != nil {
@@ -196,10 +209,15 @@ func executeSingleModel(w http.ResponseWriter, r *http.Request, body []byte, req
 		events, err := p.Execute(r.Context(), provReq)
 		if err != nil {
 			log.Printf("[CHAT] Execute error (attempt %d): %v", attempt+1, err)
+			status := providerErrorStatus(err)
 			if acct != nil {
-				acctMgr.ReportError(acct.ID, model, 500, err.Error())
+				acctMgr.ReportError(acct.ID, model, status, err.Error())
 			}
 			lastErr = err
+			lastStatus = status
+			if status >= 400 && status < 500 {
+				break
+			}
 			continue
 		}
 
@@ -213,22 +231,29 @@ func executeSingleModel(w http.ResponseWriter, r *http.Request, body []byte, req
 			accountID = acct.ID
 		}
 
-		var outputTokens int
+		var tokenUsage requestTokenUsage
 		var cost float64
 		if req.Stream {
-			outputTokens, cost = streamResponse(w, events, model, req.Model)
+			tokenUsage, cost = streamResponse(w, events, model, req.Model)
 		} else {
-			outputTokens, cost = nonStreamResponse(w, events, model, req.Model)
+			tokenUsage, cost = nonStreamResponse(w, events, model, req.Model)
 		}
+		tokenUsage = tokenUsage.forLogging(inputTokens)
 
 		// Log the request
 		if db != nil {
 			durationMs := time.Since(startTime).Milliseconds()
 			if cost == 0 {
 				inRate, outRate := database.ModelCostRates(model)
-				cost = float64(inputTokens)/1_000_000*inRate + float64(outputTokens)/1_000_000*outRate
+				cost = float64(tokenUsage.InputTokens)/1_000_000*inRate +
+					float64(tokenUsage.OutputTokens)/1_000_000*outRate
 			}
-			db.LogRequest(apiKeyID, providerType, model, effort, accountID, inputTokens, outputTokens, cost, durationMs)
+			db.LogRequest(
+				apiKeyID, providerType, model, effort, accountID,
+				tokenUsage.InputTokens, tokenUsage.OutputTokens,
+				tokenUsage.CacheCreationInputTokens, tokenUsage.CacheReadInputTokens,
+				cost, durationMs,
+			)
 		}
 		return
 	}
@@ -238,11 +263,55 @@ func executeSingleModel(w http.ResponseWriter, r *http.Request, body []byte, req
 	if lastErr != nil {
 		errMsg = lastErr.Error()
 	}
-	writeError(w, errMsg, http.StatusInternalServerError)
+	writeError(w, errMsg, lastStatus)
 }
 
-// streamResponse streams SSE events and returns output token count and cost
-func streamResponse(w http.ResponseWriter, events <-chan provider.Event, model string, originalModel string) (int, float64) {
+func providerErrorStatus(err error) int {
+	var upstreamErr *provider.UpstreamError
+	if errors.As(err, &upstreamErr) {
+		return upstreamErr.StatusCode
+	}
+	return http.StatusInternalServerError
+}
+
+type requestTokenUsage struct {
+	InputTokens              int
+	OutputTokens             int
+	CacheCreationInputTokens int
+	CacheReadInputTokens     int
+	Actual                   bool
+}
+
+func (u requestTokenUsage) forLogging(estimatedInputTokens int) requestTokenUsage {
+	if !u.Actual {
+		u.InputTokens = estimatedInputTokens
+	}
+	return u
+}
+
+func extractResponseUsage(jsonStr string) (requestTokenUsage, bool) {
+	var payload struct {
+		Usage *Usage `json:"usage"`
+	}
+	if json.Unmarshal([]byte(jsonStr), &payload) != nil || payload.Usage == nil {
+		return requestTokenUsage{}, false
+	}
+
+	usage := requestTokenUsage{
+		InputTokens:  payload.Usage.PromptTokens,
+		OutputTokens: payload.Usage.CompletionTokens,
+		Actual:       true,
+	}
+	if details := payload.Usage.PromptTokensDetails; details != nil {
+		usage.CacheCreationInputTokens = details.CacheCreationTokens
+		usage.CacheReadInputTokens = details.CachedTokens
+	}
+	return usage, true
+}
+
+// streamResponse streams SSE events and returns actual token usage when the
+// provider reports it, falling back to output-text estimation otherwise.
+func streamResponse(w http.ResponseWriter, events <-chan provider.Event, model string, originalModel string) (requestTokenUsage, float64) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -250,7 +319,7 @@ func streamResponse(w http.ResponseWriter, events <-chan provider.Event, model s
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
-		return 0, 0
+		return requestTokenUsage{}, 0
 	}
 
 	chatID := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
@@ -259,6 +328,7 @@ func streamResponse(w http.ResponseWriter, events <-chan provider.Event, model s
 	sentFinish := false
 	var totalText int
 	var cost float64
+	var tokenUsage requestTokenUsage
 
 	for event := range events {
 		switch event.Type {
@@ -281,6 +351,9 @@ func streamResponse(w http.ResponseWriter, events <-chan provider.Event, model s
 			flusher.Flush()
 			sentRole = true
 			sentFinish = sentFinish || chunkHasFinishReason(event.JSON)
+			if usage, ok := extractResponseUsage(event.JSON); ok {
+				tokenUsage = usage
+			}
 			// Try to extract token count from the chunk
 			totalText += extractChunkTextLen(event.JSON)
 
@@ -305,10 +378,18 @@ func streamResponse(w http.ResponseWriter, events <-chan provider.Event, model s
 			}
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
-			return totalText / 4, cost
+			if !tokenUsage.Actual {
+				tokenUsage.OutputTokens = totalText / 4
+			}
+			return tokenUsage, cost
 
 		case "error":
 			log.Printf("[CHAT] Stream error: %s", event.Text)
+			sendSSEError(w, flusher, event.Text)
+			if !tokenUsage.Actual {
+				tokenUsage.OutputTokens = totalText / 4
+			}
+			return tokenUsage, cost
 		}
 	}
 
@@ -325,11 +406,14 @@ func streamResponse(w http.ResponseWriter, events <-chan provider.Event, model s
 	})
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
-	return totalText / 4, cost
+	if !tokenUsage.Actual {
+		tokenUsage.OutputTokens = totalText / 4
+	}
+	return tokenUsage, cost
 }
 
 // nonStreamResponse collects all events and returns a complete response
-func nonStreamResponse(w http.ResponseWriter, events <-chan provider.Event, model string, originalModel string) (int, float64) {
+func nonStreamResponse(w http.ResponseWriter, events <-chan provider.Event, model string, originalModel string) (requestTokenUsage, float64) {
 	w.Header().Set("Content-Type", "application/json")
 
 	var fullText strings.Builder
@@ -358,7 +442,11 @@ func nonStreamResponse(w http.ResponseWriter, events <-chan provider.Event, mode
 			if chunk.Choices[0].Message != nil {
 				w.Write([]byte(fullJSON))
 				outputTokens := len(chunk.Choices[0].Message.Content) / 4
-				return outputTokens, cost
+				tokenUsage, ok := extractResponseUsage(fullJSON)
+				if !ok {
+					tokenUsage.OutputTokens = outputTokens
+				}
+				return tokenUsage, cost
 			}
 		}
 	}
@@ -383,11 +471,25 @@ func nonStreamResponse(w http.ResponseWriter, events <-chan provider.Event, mode
 	}
 
 	json.NewEncoder(w).Encode(resp)
-	return outputTokens, cost
+	return requestTokenUsage{OutputTokens: outputTokens}, cost
 }
 
 func sendSSE(w http.ResponseWriter, flusher http.Flusher, chunk ChatResponse) {
 	data, _ := json.Marshal(chunk)
+	fmt.Fprintf(w, "data: %s\n\n", data)
+	flusher.Flush()
+}
+
+func sendSSEError(w http.ResponseWriter, flusher http.Flusher, message string) {
+	payload := map[string]any{
+		"error": map[string]any{
+			"message": message,
+			"type":    "upstream_error",
+			"param":   nil,
+			"code":    "upstream_stream_error",
+		},
+	}
+	data, _ := json.Marshal(payload)
 	fmt.Fprintf(w, "data: %s\n\n", data)
 	flusher.Flush()
 }

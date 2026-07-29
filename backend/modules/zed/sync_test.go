@@ -40,7 +40,10 @@ func TestReplaceModelsPreservesJSONCAndOtherSettings(t *testing.T) {
 		"// managed by Code Proxy",
 		`"theme": "Keep Me"`,
 		`"name": "cc/claude-opus-5"`,
+		`"max_tokens": 1000000`,
+		`"max_output_tokens": 128000`,
 		`"reasoning_effort": "high"`,
+		`"interleaved_reasoning": true`,
 		`"max_tokens_parameter": true`,
 	} {
 		if !strings.Contains(text, expected) {
@@ -92,8 +95,18 @@ func TestReplaceModelsDoesNotTouchOtherProvider(t *testing.T) {
 
 func TestCodeProxyModelsFollowProviderCatalog(t *testing.T) {
 	catalog := []provider.Model{
-		{ID: "cc/claude-opus-5", Name: "Claude Opus 5"},
-		{ID: "cc/claude-haiku-4-5", Name: "Claude Haiku 4.5"},
+		{
+			ID:              "cc/claude-opus-5",
+			Name:            "Claude Opus 5",
+			MaxInputTokens:  1_000_000,
+			MaxOutputTokens: 128_000,
+		},
+		{
+			ID:              "cc/claude-haiku-4-5",
+			Name:            "Claude Haiku 4.5",
+			MaxInputTokens:  200_000,
+			MaxOutputTokens: 64_000,
+		},
 	}
 	models := CodeProxyModels(catalog)
 	if len(models) != 2 || models[0].Name != "cc/claude-opus-5" || models[0].DisplayName != "Claude Opus 5" {
@@ -102,7 +115,16 @@ func TestCodeProxyModelsFollowProviderCatalog(t *testing.T) {
 	if models[0].ReasoningEffort != "high" {
 		t.Fatalf("effort-capable model was not advertised to Zed: %#v", models[0])
 	}
+	if models[0].MaxTokens != 1_000_000 || models[0].MaxOutputTokens != 128_000 {
+		t.Fatalf("discovered token limits were not advertised to Zed: %#v", models[0])
+	}
+	if !models[0].Capabilities.InterleavedReasoning {
+		t.Fatalf("adaptive thinking model did not advertise interleaved reasoning: %#v", models[0])
+	}
 	if models[1].ReasoningEffort != "" {
 		t.Fatalf("unsupported model advertised effort controls: %#v", models[1])
+	}
+	if models[1].Capabilities.InterleavedReasoning {
+		t.Fatalf("Haiku 4.5 does not support adaptive interleaved thinking: %#v", models[1])
 	}
 }

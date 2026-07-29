@@ -38,9 +38,11 @@ type Provider interface {
 
 // Model represents an available model
 type Model struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	OwnedBy string `json:"owned_by"`
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	OwnedBy         string `json:"owned_by"`
+	MaxInputTokens  int    `json:"max_input_tokens,omitempty"`
+	MaxOutputTokens int    `json:"max_output_tokens,omitempty"`
 }
 
 // Account represents an authenticated credential for a provider

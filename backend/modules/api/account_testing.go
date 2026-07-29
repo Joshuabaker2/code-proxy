@@ -61,7 +61,7 @@ func testOAuthAccount(acct *database.Account, db *database.DB) TestResult {
 	}
 
 	// Check if token is expired
-	if acct.ExpiresAt != nil && acct.ExpiresAt.Before(time.Now().Add(-5*time.Minute)) {
+	if oauthTokenNeedsRefresh(acct.ExpiresAt) {
 		// Try to refresh
 		if acct.RefreshToken != "" {
 			providerName := mapProviderTypeToOAuth(acct.ProviderType)
@@ -81,10 +81,10 @@ func testOAuthAccount(acct *database.Account, db *database.DB) TestResult {
 
 	// For Claude/Anthropic OAuth, try a lightweight API call
 	if acct.ProviderType == "claude-cli" || acct.ProviderType == "anthropic-api" {
-		return testHTTPEndpoint("https://api.anthropic.com/v1/models", map[string]string{
-			"x-api-key":         acct.AccessToken,
-			"anthropic-version": "2023-06-01",
-		})
+		return testHTTPEndpoint(
+			"https://api.anthropic.com/v1/models",
+			claudeOAuthTestHeaders(acct.AccessToken),
+		)
 	}
 
 	// For Codex OAuth — token is only usable via CLI, can't test against OpenAI API directly
@@ -115,6 +115,21 @@ func testOAuthAccount(acct *database.Account, db *database.DB) TestResult {
 
 	// Default: token exists and not expired = valid
 	return TestResult{Valid: true}
+}
+
+func oauthTokenNeedsRefresh(expiresAt *time.Time) bool {
+	return expiresAt != nil && expiresAt.Before(time.Now().Add(5*time.Minute))
+}
+
+func claudeOAuthTestHeaders(accessToken string) map[string]string {
+	return map[string]string{
+		"Authorization":     "Bearer " + accessToken,
+		"anthropic-version": "2023-06-01",
+		"anthropic-beta":    "oauth-2025-04-20,claude-code-20250219",
+		"User-Agent":        "claude-cli/2.1.219 (external, sdk-cli)",
+		"x-app":             "cli",
+		"anthropic-dangerous-direct-browser-access": "true",
+	}
 }
 
 // testApiKeyAccount tests an API key account by hitting the provider's endpoint

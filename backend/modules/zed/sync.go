@@ -37,17 +37,28 @@ type Model struct {
 // CodeProxyModels returns the native-tool-compatible models that Code Proxy
 // exposes to Zed through the Claude subscription OAuth route.
 func CodeProxyModels(catalog []provider.Model) []Model {
-	capabilities := Capabilities{
-		Tools:                true,
-		Images:               false,
-		ParallelToolCalls:    false,
-		PromptCacheKey:       false,
-		ChatCompletions:      true,
-		InterleavedReasoning: false,
-		MaxTokensParameter:   true,
-	}
 	models := make([]Model, 0, len(catalog))
 	for _, catalogModel := range catalog {
+		capabilities := Capabilities{
+			Tools:                true,
+			Images:               false,
+			ParallelToolCalls:    false,
+			PromptCacheKey:       false,
+			ChatCompletions:      true,
+			InterleavedReasoning: provider.ClaudeSupportsAdaptiveThinking(catalogModel.ID),
+			MaxTokensParameter:   true,
+		}
+		maxTokens := catalogModel.MaxInputTokens
+		maxOutputTokens := catalogModel.MaxOutputTokens
+		if maxTokens <= 0 || maxOutputTokens <= 0 {
+			fallbackInput, fallbackOutput := provider.ClaudeModelLimits(catalogModel.ID)
+			if maxTokens <= 0 {
+				maxTokens = fallbackInput
+			}
+			if maxOutputTokens <= 0 {
+				maxOutputTokens = fallbackOutput
+			}
+		}
 		reasoningEffort := ""
 		if supportsClaudeEffort(catalogModel.ID) {
 			reasoningEffort = "high"
@@ -55,8 +66,8 @@ func CodeProxyModels(catalog []provider.Model) []Model {
 		models = append(models, Model{
 			Name:            catalogModel.ID,
 			DisplayName:     catalogModel.Name,
-			MaxTokens:       200000,
-			MaxOutputTokens: 64000,
+			MaxTokens:       maxTokens,
+			MaxOutputTokens: maxOutputTokens,
 			ReasoningEffort: reasoningEffort,
 			Capabilities:    capabilities,
 		})

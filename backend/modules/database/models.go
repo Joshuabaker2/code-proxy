@@ -22,26 +22,28 @@ type Provider struct {
 }
 
 type Settings struct {
-	TunnelEnabled  bool   `json:"tunnel_enabled"`
-	TunnelURL      string `json:"tunnel_url"`
-	TunnelToken    string `json:"tunnel_token,omitempty"`
-	DefaultModel   string `json:"default_model"`
-	LogRetention   int    `json:"log_retention_days"`
-	RequireApiKey  bool   `json:"require_api_key"`
+	TunnelEnabled     bool   `json:"tunnel_enabled"`
+	TunnelURL         string `json:"tunnel_url"`
+	TunnelToken       string `json:"tunnel_token,omitempty"`
+	DefaultModel      string `json:"default_model"`
+	LogRetention      int    `json:"log_retention_days"`
+	RequireApiKey     bool   `json:"require_api_key"`
 	DashboardPassword string `json:"dashboard_password,omitempty"`
 }
 
 type RequestLog struct {
-	ID            int64     `json:"id"`
-	ApiKeyID      string    `json:"api_key_id,omitempty"`
-	ApiKeyName    string    `json:"api_key_name,omitempty"`
-	Provider      string    `json:"provider"`
-	Model         string    `json:"model"`
-	Effort        string    `json:"effort,omitempty"`
-	AccountID     string    `json:"account_id,omitempty"`
-	InputTokens   int       `json:"input_tokens"`
-	OutputTokens  int       `json:"output_tokens"`
-	EstimatedCost float64   `json:"estimated_cost"`
-	DurationMs    int64     `json:"duration_ms"`
-	CreatedAt     time.Time `json:"created_at"`
+	ID                       int64     `json:"id"`
+	ApiKeyID                 string    `json:"api_key_id,omitempty"`
+	ApiKeyName               string    `json:"api_key_name,omitempty"`
+	Provider                 string    `json:"provider"`
+	Model                    string    `json:"model"`
+	Effort                   string    `json:"effort,omitempty"`
+	AccountID                string    `json:"account_id,omitempty"`
+	InputTokens              int       `json:"input_tokens"`
+	OutputTokens             int       `json:"output_tokens"`
+	CacheCreationInputTokens int       `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int       `json:"cache_read_input_tokens"`
+	EstimatedCost            float64   `json:"estimated_cost"`
+	DurationMs               int64     `json:"duration_ms"`
+	CreatedAt                time.Time `json:"created_at"`
 }

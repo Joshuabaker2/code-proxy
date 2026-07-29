@@ -11,6 +11,14 @@ import (
 
 // TranslateOpenAIToAnthropic translates an OpenAI chat/completions request to the Claude Messages API
 func TranslateOpenAIToAnthropic(body []byte, model string) ([]byte, string, error) {
+	return translateOpenAIToAnthropic(body, model, nil)
+}
+
+func translateOpenAIToAnthropic(
+	body []byte,
+	model string,
+	resolveThinking func(json.RawMessage, string) []map[string]any,
+) ([]byte, string, error) {
 	var openAI struct {
 		Model       string            `json:"model"`
 		Messages    []json.RawMessage `json:"messages"`
@@ -28,8 +36,15 @@ func TranslateOpenAIToAnthropic(body []byte, model string) ([]byte, string, erro
 
 	// Build the Anthropic request
 	claude := map[string]any{
-		"model":  mapModelToAnthropic(model),
-		"stream": openAI.Stream,
+		"model":         mapModelToAnthropic(model),
+		"stream":        openAI.Stream,
+		"cache_control": map[string]string{"type": "ephemeral"},
+	}
+	if ClaudeSupportsAdaptiveThinking(model) {
+		claude["thinking"] = map[string]string{
+			"type":    "adaptive",
+			"display": "summarized",
+		}
 	}
 
 	// Max tokens (required by Claude)
@@ -55,10 +70,11 @@ func TranslateOpenAIToAnthropic(body []byte, model string) ([]byte, string, erro
 
 	for _, rawMsg := range openAI.Messages {
 		var msg struct {
-			Role       string          `json:"role"`
-			Content    json.RawMessage `json:"content"`
-			ToolCalls  json.RawMessage `json:"tool_calls,omitempty"`
-			ToolCallID string          `json:"tool_call_id,omitempty"`
+			Role             string          `json:"role"`
+			Content          json.RawMessage `json:"content"`
+			ReasoningContent string          `json:"reasoning_content,omitempty"`
+			ToolCalls        json.RawMessage `json:"tool_calls,omitempty"`
+			ToolCallID       string          `json:"tool_call_id,omitempty"`
 		}
 		if json.Unmarshal(rawMsg, &msg) != nil {
 			continue
@@ -85,9 +101,18 @@ func TranslateOpenAIToAnthropic(body []byte, model string) ([]byte, string, erro
 			}
 			// If there are tool_calls, convert them into content blocks
 			if msg.ToolCalls != nil {
-				content := convertAssistantWithToolCalls(msg.Content, msg.ToolCalls)
+				var thinkingBlocks []map[string]any
+				if resolveThinking != nil {
+					thinkingBlocks = resolveThinking(msg.ToolCalls, mapModelToAnthropic(model))
+				}
+				content := convertAssistantWithToolCalls(msg.Content, msg.ToolCalls, thinkingBlocks)
 				claudeMsg["content"] = content
 			} else {
+				// OpenAI-compatible clients can replay visible reasoning in
+				// reasoning_content, but Anthropic only accepts its original
+				// signed thinking blocks. Outside a tool-use continuation those
+				// blocks may be omitted, so never turn replayed reasoning into
+				// visible assistant text.
 				claudeMsg["content"] = convertContent(msg.Content)
 			}
 			claudeMessages = append(claudeMessages, claudeMsg)
@@ -211,6 +236,7 @@ func TranslateAnthropicStreamToOpenAI(data []byte) ([]byte, error) {
 		var delta struct {
 			Type        string `json:"type"`
 			Text        string `json:"text,omitempty"`
+			Thinking    string `json:"thinking,omitempty"`
 			PartialJSON string `json:"partial_json,omitempty"`
 		}
 		if json.Unmarshal(event.Delta, &delta) != nil {
@@ -218,6 +244,24 @@ func TranslateAnthropicStreamToOpenAI(data []byte) ([]byte, error) {
 		}
 
 		switch delta.Type {
+		case "thinking_delta":
+			chunk := map[string]any{
+				"id":      chatID,
+				"object":  "chat.completion.chunk",
+				"created": created,
+				"choices": []map[string]any{{
+					"index": 0,
+					"delta": map[string]any{"reasoning_content": delta.Thinking},
+				}},
+			}
+			return json.Marshal(chunk)
+
+		case "signature_delta":
+			// Signatures are captured by AnthropicAPI for exact replay
+			// during tool-use continuations. They are opaque and should not
+			// be exposed as visible reasoning text.
+			return nil, nil
+
 		case "text_delta":
 			chunk := map[string]any{
 				"id":      chatID,
@@ -288,21 +332,26 @@ func TranslateAnthropicStreamToOpenAI(data []byte) ([]byte, error) {
 // TranslateAnthropicResponseToOpenAI translates a complete Claude response into OpenAI format
 func TranslateAnthropicResponseToOpenAI(data []byte) ([]byte, error) {
 	var claude struct {
-		ID           string `json:"id"`
-		Type         string `json:"type"`
-		Role         string `json:"role"`
-		Model        string `json:"model"`
-		StopReason   string `json:"stop_reason"`
-		Content      []struct {
-			Type  string          `json:"type"`
-			Text  string          `json:"text,omitempty"`
-			ID    string          `json:"id,omitempty"`
-			Name  string          `json:"name,omitempty"`
-			Input json.RawMessage `json:"input,omitempty"`
+		ID         string `json:"id"`
+		Type       string `json:"type"`
+		Role       string `json:"role"`
+		Model      string `json:"model"`
+		StopReason string `json:"stop_reason"`
+		Content    []struct {
+			Type      string          `json:"type"`
+			Text      string          `json:"text,omitempty"`
+			Thinking  string          `json:"thinking,omitempty"`
+			Signature string          `json:"signature,omitempty"`
+			Data      string          `json:"data,omitempty"`
+			ID        string          `json:"id,omitempty"`
+			Name      string          `json:"name,omitempty"`
+			Input     json.RawMessage `json:"input,omitempty"`
 		} `json:"content"`
 		Usage struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
+			InputTokens              int `json:"input_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+			OutputTokens             int `json:"output_tokens"`
 		} `json:"usage"`
 	}
 
@@ -312,10 +361,15 @@ func TranslateAnthropicResponseToOpenAI(data []byte) ([]byte, error) {
 
 	// Extract text and tool_calls
 	var textParts []string
+	var reasoningParts []string
 	var toolCalls []map[string]any
 
 	for _, block := range claude.Content {
 		switch block.Type {
+		case "thinking":
+			if block.Thinking != "" {
+				reasoningParts = append(reasoningParts, block.Thinking)
+			}
 		case "text":
 			textParts = append(textParts, block.Text)
 		case "tool_use":
@@ -344,7 +398,13 @@ func TranslateAnthropicResponseToOpenAI(data []byte) ([]byte, error) {
 	if len(toolCalls) > 0 {
 		message["tool_calls"] = toolCalls
 	}
+	if len(reasoningParts) > 0 {
+		message["reasoning_content"] = strings.Join(reasoningParts, "")
+	}
 
+	promptTokens := claude.Usage.InputTokens +
+		claude.Usage.CacheCreationInputTokens +
+		claude.Usage.CacheReadInputTokens
 	openAI := map[string]any{
 		"id":      claude.ID,
 		"object":  "chat.completion",
@@ -356,9 +416,13 @@ func TranslateAnthropicResponseToOpenAI(data []byte) ([]byte, error) {
 			"finish_reason": finishReason,
 		}},
 		"usage": map[string]any{
-			"prompt_tokens":     claude.Usage.InputTokens,
+			"prompt_tokens":     promptTokens,
 			"completion_tokens": claude.Usage.OutputTokens,
-			"total_tokens":      claude.Usage.InputTokens + claude.Usage.OutputTokens,
+			"total_tokens":      promptTokens + claude.Usage.OutputTokens,
+			"prompt_tokens_details": map[string]any{
+				"cached_tokens":         claude.Usage.CacheReadInputTokens,
+				"cache_creation_tokens": claude.Usage.CacheCreationInputTokens,
+			},
 		},
 	}
 
@@ -368,6 +432,10 @@ func TranslateAnthropicResponseToOpenAI(data []byte) ([]byte, error) {
 // --- Helpers ---
 
 func extractTextFromContent(raw json.RawMessage) string {
+	if len(raw) == 0 || strings.TrimSpace(string(raw)) == "null" {
+		return ""
+	}
+
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
 		return s
@@ -403,8 +471,11 @@ func convertContent(raw json.RawMessage) any {
 	return string(raw)
 }
 
-func convertAssistantWithToolCalls(content, toolCalls json.RawMessage) []map[string]any {
-	var blocks []map[string]any
+func convertAssistantWithToolCalls(
+	content, toolCalls json.RawMessage,
+	thinkingBlocks []map[string]any,
+) []map[string]any {
+	blocks := append([]map[string]any(nil), thinkingBlocks...)
 
 	// Add text block if present
 	text := extractTextFromContent(content)

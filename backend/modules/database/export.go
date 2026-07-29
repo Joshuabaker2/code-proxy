@@ -81,6 +81,7 @@ func (db *DB) Export(includeLogs bool) (*ExportData, error) {
 		lrows, err := db.conn.Query(`
 			SELECT id, COALESCE(api_key_id,''), '', provider, model, COALESCE(effort,''),
 			       COALESCE(account_id,''), input_tokens, output_tokens,
+			       COALESCE(cache_creation_input_tokens,0), COALESCE(cache_read_input_tokens,0),
 			       COALESCE(estimated_cost,0), duration_ms, created_at
 			FROM request_logs ORDER BY created_at
 		`)
@@ -91,7 +92,9 @@ func (db *DB) Export(includeLogs bool) (*ExportData, error) {
 		for lrows.Next() {
 			var l RequestLog
 			if err := lrows.Scan(&l.ID, &l.ApiKeyID, &l.ApiKeyName, &l.Provider, &l.Model, &l.Effort,
-				&l.AccountID, &l.InputTokens, &l.OutputTokens, &l.EstimatedCost, &l.DurationMs, &l.CreatedAt); err != nil {
+				&l.AccountID, &l.InputTokens, &l.OutputTokens,
+				&l.CacheCreationInputTokens, &l.CacheReadInputTokens,
+				&l.EstimatedCost, &l.DurationMs, &l.CreatedAt); err != nil {
 				return nil, err
 			}
 			data.Logs = append(data.Logs, l)
@@ -198,9 +201,14 @@ func (db *DB) Import(data *ExportData, mode string) (*ImportResult, error) {
 	// Import logs
 	for _, l := range data.Logs {
 		res, err := db.conn.Exec(
-			`INSERT OR IGNORE INTO request_logs (id, api_key_id, provider, model, effort, account_id, input_tokens, output_tokens, estimated_cost, duration_ms, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			l.ID, l.ApiKeyID, l.Provider, l.Model, l.Effort, l.AccountID, l.InputTokens, l.OutputTokens, l.EstimatedCost, l.DurationMs, l.CreatedAt,
+			`INSERT OR IGNORE INTO request_logs (
+				id, api_key_id, provider, model, effort, account_id,
+				input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+				estimated_cost, duration_ms, created_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			l.ID, l.ApiKeyID, l.Provider, l.Model, l.Effort, l.AccountID,
+			l.InputTokens, l.OutputTokens, l.CacheCreationInputTokens, l.CacheReadInputTokens,
+			l.EstimatedCost, l.DurationMs, l.CreatedAt,
 		)
 		if err == nil {
 			if n, _ := res.RowsAffected(); n > 0 {
