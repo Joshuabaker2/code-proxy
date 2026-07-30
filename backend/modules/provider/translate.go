@@ -124,7 +124,7 @@ func translateOpenAIToAnthropic(
 				"content": []map[string]any{{
 					"type":        "tool_result",
 					"tool_use_id": msg.ToolCallID,
-					"content":     extractTextFromContent(msg.Content),
+					"content":     convertContent(msg.Content),
 				}},
 			}
 			claudeMessages = append(claudeMessages, claudeMsg)
@@ -463,12 +463,67 @@ func convertContent(raw json.RawMessage) any {
 	if json.Unmarshal(raw, &s) == nil {
 		return s
 	}
-	// If it's an array, it may contain images etc. — pass through
-	var arr []any
+	var arr []map[string]any
 	if json.Unmarshal(raw, &arr) == nil {
-		return arr
+		converted := make([]map[string]any, 0, len(arr))
+		for _, part := range arr {
+			converted = append(converted, convertContentPart(part))
+		}
+		return converted
 	}
 	return string(raw)
+}
+
+func convertContentPart(part map[string]any) map[string]any {
+	if part["type"] != "image_url" {
+		return part
+	}
+
+	imageURL, ok := part["image_url"].(map[string]any)
+	if !ok {
+		return part
+	}
+	url, ok := imageURL["url"].(string)
+	if !ok || url == "" {
+		return part
+	}
+
+	if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
+		return map[string]any{
+			"type": "image",
+			"source": map[string]any{
+				"type": "url",
+				"url":  url,
+			},
+		}
+	}
+
+	const dataPrefix = "data:"
+	if !strings.HasPrefix(url, dataPrefix) {
+		return part
+	}
+	comma := strings.IndexByte(url, ',')
+	if comma < len(dataPrefix) {
+		return part
+	}
+	metadata := url[len(dataPrefix):comma]
+	if !strings.HasSuffix(metadata, ";base64") {
+		return part
+	}
+	mediaType := strings.TrimSuffix(metadata, ";base64")
+	data := url[comma+1:]
+	if mediaType == "" || data == "" {
+		return part
+	}
+
+	return map[string]any{
+		"type": "image",
+		"source": map[string]any{
+			"type":       "base64",
+			"media_type": mediaType,
+			"data":       data,
+		},
+	}
 }
 
 func convertAssistantWithToolCalls(

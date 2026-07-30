@@ -117,6 +117,131 @@ func TestTranslateOpenAIToAnthropicDoesNotEnableAdaptiveThinkingForHaiku45(t *te
 	}
 }
 
+func TestTranslateOpenAIToAnthropicPreservesImageContent(t *testing.T) {
+	input := []byte(`{
+		"model":"claude-opus-5",
+		"messages":[{
+			"role":"user",
+			"content":[
+				{"type":"text","text":"What is in this image?"},
+				{
+					"type":"image_url",
+					"image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="}
+				}
+			]
+		}],
+		"stream":true
+	}`)
+
+	body, _, err := TranslateOpenAIToAnthropic(input, "claude-opus-5")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var request struct {
+		Messages []struct {
+			Content []struct {
+				Type   string `json:"type"`
+				Text   string `json:"text,omitempty"`
+				Source *struct {
+					Type      string `json:"type"`
+					MediaType string `json:"media_type"`
+					Data      string `json:"data"`
+				} `json:"source,omitempty"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &request); err != nil {
+		t.Fatal(err)
+	}
+	if len(request.Messages) != 1 || len(request.Messages[0].Content) != 2 {
+		t.Fatalf("image content was dropped or flattened: %s", body)
+	}
+	image := request.Messages[0].Content[1]
+	if image.Type != "image" || image.Source == nil ||
+		image.Source.Type != "base64" ||
+		image.Source.MediaType != "image/png" ||
+		image.Source.Data != "iVBORw0KGgoAAAANSUhEUg==" {
+		t.Fatalf("image was not translated to an Anthropic image block: %#v", image)
+	}
+}
+
+func TestTranslateOpenAIToAnthropicPreservesToolResultImageContent(t *testing.T) {
+	input := []byte(`{
+		"model":"claude-opus-5",
+		"messages":[
+			{"role":"user","content":"Render the map"},
+			{
+				"role":"assistant",
+				"content":null,
+				"tool_calls":[{
+					"id":"toolu_read_image",
+					"type":"function",
+					"function":{"name":"read_file","arguments":"{\"path\":\"map.png\"}"}
+				}]
+			},
+			{
+				"role":"tool",
+				"tool_call_id":"toolu_read_image",
+				"content":[
+					{"type":"text","text":"Rendered map.png"},
+					{
+						"type":"image_url",
+						"image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="}
+					}
+				]
+			}
+		],
+		"stream":true
+	}`)
+
+	body, _, err := TranslateOpenAIToAnthropic(input, "claude-opus-5")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var request struct {
+		Messages []struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &request); err != nil {
+		t.Fatal(err)
+	}
+	if len(request.Messages) != 3 {
+		t.Fatalf("tool result message was not preserved: %s", body)
+	}
+	var content []struct {
+		Type    string `json:"type"`
+		Content []struct {
+			Type   string `json:"type"`
+			Text   string `json:"text,omitempty"`
+			Source *struct {
+				Type      string `json:"type"`
+				MediaType string `json:"media_type"`
+				Data      string `json:"data"`
+			} `json:"source,omitempty"`
+		} `json:"content,omitempty"`
+	}
+	if err := json.Unmarshal(request.Messages[2].Content, &content); err != nil {
+		t.Fatal(err)
+	}
+	if len(content) != 1 {
+		t.Fatalf("tool result message was not preserved: %s", body)
+	}
+	toolResult := content[0]
+	if toolResult.Type != "tool_result" || len(toolResult.Content) != 2 {
+		t.Fatalf("tool result image content was dropped or flattened: %s", body)
+	}
+	image := toolResult.Content[1]
+	if image.Type != "image" || image.Source == nil ||
+		image.Source.Type != "base64" ||
+		image.Source.MediaType != "image/png" ||
+		image.Source.Data != "iVBORw0KGgoAAAANSUhEUg==" {
+		t.Fatalf("tool result image was not translated to an Anthropic image block: %#v", image)
+	}
+}
+
 func TestApplyAnthropicEffort(t *testing.T) {
 	input := []byte(`{
 		"model":"claude-opus-5",

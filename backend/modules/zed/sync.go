@@ -41,7 +41,7 @@ func CodeProxyModels(catalog []provider.Model) []Model {
 	for _, catalogModel := range catalog {
 		capabilities := Capabilities{
 			Tools:                true,
-			Images:               false,
+			Images:               true,
 			ParallelToolCalls:    false,
 			PromptCacheKey:       false,
 			ChatCompletions:      true,

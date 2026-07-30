@@ -121,6 +121,9 @@ func TestCodeProxyModelsFollowProviderCatalog(t *testing.T) {
 	if !models[0].Capabilities.InterleavedReasoning {
 		t.Fatalf("adaptive thinking model did not advertise interleaved reasoning: %#v", models[0])
 	}
+	if !models[0].Capabilities.Images {
+		t.Fatalf("vision-capable Claude model did not advertise image support: %#v", models[0])
+	}
 	if models[1].ReasoningEffort != "" {
 		t.Fatalf("unsupported model advertised effort controls: %#v", models[1])
 	}
