@@ -91,7 +91,7 @@ func translateOpenAIToAnthropic(
 		case "user":
 			claudeMsg := map[string]any{
 				"role":    "user",
-				"content": convertContent(msg.Content),
+				"content": convertContent(normalizeGooseUserContent(msg.Content)),
 			}
 			claudeMessages = append(claudeMessages, claudeMsg)
 
@@ -474,6 +474,74 @@ func convertContent(raw json.RawMessage) any {
 	return string(raw)
 }
 
+const (
+	gooseTurnContextOpen  = "<turn-context>"
+	gooseTurnContextClose = "</turn-context>"
+)
+
+// Goose injects time and working-directory metadata at the front of the
+// current human turn, then removes it from that historical message when the
+// next human turn starts. Forwarding the transient wrapper makes an otherwise
+// identical Anthropic prompt prefix change retroactively and invalidates its
+// cache. The sidecar already owns the workspace, so strip only Goose's exact
+// generated wrapper while preserving the user's content byte-for-byte.
+func normalizeGooseUserContent(raw json.RawMessage) json.RawMessage {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		normalized := stripGooseTurnContext(text)
+		if normalized == text {
+			return raw
+		}
+		encoded, err := json.Marshal(normalized)
+		if err == nil {
+			return encoded
+		}
+		return raw
+	}
+
+	var parts []map[string]any
+	if json.Unmarshal(raw, &parts) != nil {
+		return raw
+	}
+	for index, part := range parts {
+		if part["type"] != "text" {
+			continue
+		}
+		partText, ok := part["text"].(string)
+		if !ok {
+			continue
+		}
+		normalized := stripGooseTurnContext(partText)
+		if normalized == partText {
+			return raw
+		}
+		parts[index]["text"] = normalized
+		encoded, err := json.Marshal(parts)
+		if err == nil {
+			return encoded
+		}
+		return raw
+	}
+	return raw
+}
+
+func stripGooseTurnContext(text string) string {
+	if !strings.HasPrefix(text, gooseTurnContextOpen) {
+		return text
+	}
+	end := strings.Index(text, gooseTurnContextClose)
+	if end < 0 {
+		return text
+	}
+	wrapper := text[len(gooseTurnContextOpen):end]
+	if !strings.Contains(wrapper, "<current-time>") ||
+		!strings.Contains(wrapper, "<working-directory>") {
+		return text
+	}
+	contentStart := end + len(gooseTurnContextClose)
+	return strings.TrimLeft(text[contentStart:], "\r\n")
+}
+
 func convertContentPart(part map[string]any) map[string]any {
 	if part["type"] != "image_url" {
 		return part
@@ -634,10 +702,10 @@ func mapModelToAnthropic(model string) string {
 	// Map short names
 	switch {
 	case strings.Contains(lower, "opus"):
-		return "claude-opus-4-6-20250610"
+		return "claude-opus-4-6"
 	case strings.Contains(lower, "haiku"):
 		return "claude-haiku-4-5-20251001"
 	default:
-		return "claude-sonnet-4-6-20250514"
+		return "claude-sonnet-4-6"
 	}
 }

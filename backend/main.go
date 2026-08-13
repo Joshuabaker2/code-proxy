@@ -67,26 +67,30 @@ func main() {
 
 	// Account manager
 	acctMgr := account.NewManager(db)
-
-	// Background token refresh (every 5 minutes)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go acctMgr.RefreshLoop(ctx, 5*time.Minute, func(acct *provider.Account) error {
-		if db == nil || acct.RefreshToken == "" {
-			return nil
+	acctMgr.SetTokenRefresher(func(acct *provider.Account) (account.RefreshedTokens, error) {
+		if acct.RefreshToken == "" {
+			return account.RefreshedTokens{}, fmt.Errorf("OAuth account has no refresh token")
 		}
 		oauthProvider := auth.ProviderNameForType(acct.ProviderType)
 		oauthConfig, ok := auth.GetConfig(oauthProvider)
 		if !ok {
-			return fmt.Errorf("OAuth config not found for %s", acct.ProviderType)
+			return account.RefreshedTokens{}, fmt.Errorf("OAuth config not found for %s", acct.ProviderType)
 		}
 		tokens, err := auth.RefreshTokens(oauthConfig, acct.RefreshToken)
 		if err != nil {
-			return err
+			return account.RefreshedTokens{}, err
 		}
-		expiresAt := tokens.ExpiresAt
-		return db.UpdateAccountTokens(acct.ID, tokens.AccessToken, tokens.RefreshToken, &expiresAt)
+		return account.RefreshedTokens{
+			AccessToken:  tokens.AccessToken,
+			RefreshToken: tokens.RefreshToken,
+			ExpiresAt:    tokens.ExpiresAt,
+		}, nil
 	})
+
+	// Background token refresh (every 5 minutes)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go acctMgr.RefreshLoop(ctx, 5*time.Minute)
 
 	if os.Getenv("ZED_SYNC_MODELS") == "true" {
 		settingsPath := os.Getenv("ZED_SETTINGS_PATH")

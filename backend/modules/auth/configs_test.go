@@ -10,3 +10,13 @@ func TestProviderNameForType(t *testing.T) {
 		t.Fatalf("unknown provider changed to %q", got)
 	}
 }
+
+func TestClaudeUsesCurrentClaudeCodeTokenService(t *testing.T) {
+	config, ok := GetConfig("claude")
+	if !ok {
+		t.Fatal("Claude OAuth config is missing")
+	}
+	if config.TokenURL != "https://platform.claude.com/v1/oauth/token" {
+		t.Fatalf("Claude token URL = %q", config.TokenURL)
+	}
+}

@@ -22,6 +22,11 @@ func Open(path string) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
+	// SQLite is a single-writer store. Keeping one shared connection prevents a
+	// concurrent OAuth refresh from racing ordinary account reads and losing a
+	// newly rotated (single-use) refresh token to SQLITE_BUSY.
+	conn.SetMaxOpenConns(1)
+	conn.SetMaxIdleConns(1)
 
 	db := &DB{conn: conn}
 	if err := db.migrate(); err != nil {
@@ -719,10 +724,10 @@ func (db *DB) GetAccountUsageForPeriod(period string) []map[string]any {
 			"label":          label,
 			"auth_mode":      authMode,
 			"requests":       requests,
-			"input_tokens":  inTok,
-			"output_tokens": outTok,
+			"input_tokens":   inTok,
+			"output_tokens":  outTok,
 			"estimated_cost": cost,
-			"last_used_at":  lastUsedISO,
+			"last_used_at":   lastUsedISO,
 		})
 	}
 	return res
@@ -780,12 +785,12 @@ func (db *DB) GetAccountRecentRequests(accountID string, limit int, period strin
 			continue
 		}
 		res = append(res, map[string]any{
-			"model":           model,
+			"model":          model,
 			"input_tokens":   inTok,
 			"output_tokens":  outTok,
 			"estimated_cost": cost,
 			"duration_ms":    dur,
-			"created_at":      t.Format(time.RFC3339),
+			"created_at":     t.Format(time.RFC3339),
 			"key_name":       keyName,
 			"key_masked":     maskKey(keyRaw),
 			"provider":       provider,

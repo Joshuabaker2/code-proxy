@@ -1,14 +1,47 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"code-proxy/modules/account"
+	"code-proxy/modules/database"
 	"code-proxy/modules/provider"
 )
+
+type authRecoveryProvider struct {
+	mu     sync.Mutex
+	tokens []string
+}
+
+func (p *authRecoveryProvider) Name() string             { return "auth-recovery" }
+func (p *authRecoveryProvider) Models() []provider.Model { return nil }
+func (p *authRecoveryProvider) Category() string         { return "api" }
+func (p *authRecoveryProvider) IsAvailable() bool        { return true }
+
+func (p *authRecoveryProvider) Execute(_ context.Context, req *provider.Request) (<-chan provider.Event, error) {
+	p.mu.Lock()
+	p.tokens = append(p.tokens, req.Account.AccessToken)
+	p.mu.Unlock()
+	if req.Account.AccessToken == "access-old" {
+		return nil, &provider.UpstreamError{
+			StatusCode: http.StatusUnauthorized,
+			Body:       `{"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}}`,
+		}
+	}
+	events := make(chan provider.Event, 2)
+	events <- provider.Event{Type: "text", Text: "recovered"}
+	events <- provider.Event{Type: "done"}
+	close(events)
+	return events, nil
+}
 
 func TestChunkHasFinishReason(t *testing.T) {
 	if chunkHasFinishReason(`{"choices":[{"delta":{},"finish_reason":null}]}`) {
@@ -119,5 +152,73 @@ func TestStreamResponseForwardsProviderErrorWithoutSuccessfulStop(t *testing.T) 
 		if strings.Contains(body, forbidden) {
 			t.Fatalf("stream error was disguised as success (%q): %s", forbidden, body)
 		}
+	}
+}
+
+func TestChatRecoversFromUpstream401WithRotatedOAuthToken(t *testing.T) {
+	db, err := database.Open(filepath.Join(t.TempDir(), "data.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	expiresAt := time.Now().Add(4 * time.Hour)
+	created, err := db.CreateAccountFull(
+		"anthropic-api",
+		"Claude",
+		"oauth",
+		"access-old",
+		"refresh-old",
+		"",
+		&expiresAt,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+
+	manager := account.NewManager(db)
+	refreshCalls := 0
+	manager.SetTokenRefresher(func(stored *provider.Account) (account.RefreshedTokens, error) {
+		refreshCalls++
+		return account.RefreshedTokens{
+			AccessToken:  "access-new",
+			RefreshToken: "refresh-new",
+			ExpiresAt:    time.Now().Add(8 * time.Hour),
+		}, nil
+	})
+	fakeProvider := &authRecoveryProvider{}
+	registry := provider.NewRegistry()
+	registry.Register("anthropic-api", fakeProvider)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/v1/chat/completions",
+		strings.NewReader(`{"model":"claude-sonnet-5","messages":[{"role":"user","content":"hello"}],"stream":false}`),
+	)
+
+	handleChat(registry, manager, "claude-sonnet-5", db).ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "recovered") {
+		t.Fatalf("chat response = %d %s, want recovered 200", recorder.Code, recorder.Body.String())
+	}
+	if refreshCalls != 1 {
+		t.Fatalf("refresh calls = %d, want 1", refreshCalls)
+	}
+	fakeProvider.mu.Lock()
+	gotTokens := append([]string(nil), fakeProvider.tokens...)
+	fakeProvider.mu.Unlock()
+	if strings.Join(gotTokens, ",") != "access-old,access-new" {
+		t.Fatalf("provider tokens = %v, want old then new", gotTokens)
+	}
+	stored, err := db.GetAccount(created.ID)
+	if err != nil {
+		t.Fatalf("get refreshed account: %v", err)
+	}
+	if stored.AccessToken != "access-new" || stored.RefreshToken != "refresh-new" {
+		t.Fatalf("stored tokens were not rotated: %#v", stored)
+	}
+	if stored.CooldownUntil != nil {
+		t.Fatalf("successful auth recovery left a cooldown: %v", stored.CooldownUntil)
 	}
 }

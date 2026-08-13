@@ -105,6 +105,7 @@ func executeSingleModelForCombo(w http.ResponseWriter, r *http.Request, body []b
 	apiKeyID := GetApiKeyID(r)
 	inputTokens := estimateInputTokens(body)
 
+	authRecoveryAttempted := false
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		acct, err := acctMgr.Select(providerType, cleanModel)
 		if err != nil {
@@ -122,6 +123,15 @@ func executeSingleModelForCombo(w http.ResponseWriter, r *http.Request, body []b
 		events, err := p.Execute(r.Context(), provReq)
 		if err != nil {
 			status := providerErrorStatus(err)
+			if status == http.StatusUnauthorized && !authRecoveryAttempted && acct != nil {
+				authRecoveryAttempted = true
+				if _, refreshErr := acctMgr.RefreshAfterAuthFailure(acct); refreshErr == nil {
+					log.Printf("[CHAT] OAuth token refreshed after upstream 401; retrying %s", cleanModel)
+					continue
+				} else {
+					log.Printf("[CHAT] OAuth recovery failed after upstream 401: %v", refreshErr)
+				}
+			}
 			if acct != nil {
 				acctMgr.ReportError(acct.ID, cleanModel, status, err.Error())
 			}
@@ -190,6 +200,7 @@ func executeSingleModel(w http.ResponseWriter, r *http.Request, body []byte, req
 
 	var lastErr error
 	lastStatus := http.StatusInternalServerError
+	authRecoveryAttempted := false
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		acct, err := acctMgr.Select(providerType, model)
 		if err != nil {
@@ -210,6 +221,15 @@ func executeSingleModel(w http.ResponseWriter, r *http.Request, body []byte, req
 		if err != nil {
 			log.Printf("[CHAT] Execute error (attempt %d): %v", attempt+1, err)
 			status := providerErrorStatus(err)
+			if status == http.StatusUnauthorized && !authRecoveryAttempted && acct != nil {
+				authRecoveryAttempted = true
+				if _, refreshErr := acctMgr.RefreshAfterAuthFailure(acct); refreshErr == nil {
+					log.Printf("[CHAT] OAuth token refreshed after upstream 401; retrying %s", model)
+					continue
+				} else {
+					log.Printf("[CHAT] OAuth recovery failed after upstream 401: %v", refreshErr)
+				}
+			}
 			if acct != nil {
 				acctMgr.ReportError(acct.ID, model, status, err.Error())
 			}

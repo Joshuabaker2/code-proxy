@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -97,6 +98,43 @@ func TestTranslateOpenAIToAnthropicEnablesAutomaticPromptCaching(t *testing.T) {
 	}
 }
 
+func TestTranslateOpenAIToAnthropicNormalizesTransientGooseTurnContext(t *testing.T) {
+	withTurnContext := []byte(`{
+		"model":"claude-sonnet-5",
+		"messages":[{
+			"role":"user",
+			"content":"<turn-context>\n<current-time>2026-08-12T20:58:00-07:00</current-time>\n<working-directory>/tmp/workspace</working-directory>\n</turn-context>\n\nReview this application."
+		}],
+		"stream":true
+	}`)
+	withoutTurnContext := []byte(`{
+		"model":"claude-sonnet-5",
+		"messages":[{"role":"user","content":"Review this application."}],
+		"stream":true
+	}`)
+
+	translatedWithContext, _, err := TranslateOpenAIToAnthropic(withTurnContext, "claude-sonnet-5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	translatedWithoutContext, _, err := TranslateOpenAIToAnthropic(withoutTurnContext, "claude-sonnet-5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var withContext, withoutContext struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal(translatedWithContext, &withContext); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(translatedWithoutContext, &withoutContext); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(withContext.Messages, withoutContext.Messages) {
+		t.Fatalf("transient Goose turn context changed the Anthropic cache prefix: %#v", withContext.Messages)
+	}
+}
+
 func TestTranslateOpenAIToAnthropicDoesNotEnableAdaptiveThinkingForHaiku45(t *testing.T) {
 	input := []byte(`{
 		"model":"claude-haiku-4-5-20251001",
@@ -114,6 +152,20 @@ func TestTranslateOpenAIToAnthropicDoesNotEnableAdaptiveThinkingForHaiku45(t *te
 	}
 	if got["thinking"] != nil {
 		t.Fatalf("Haiku 4.5 does not support adaptive thinking: %s", body)
+	}
+}
+
+func TestMapModelToAnthropicUsesCanonicalModelIDs(t *testing.T) {
+	tests := map[string]string{
+		"sonnet": "claude-sonnet-4-6",
+		"opus":   "claude-opus-4-6",
+		"haiku":  "claude-haiku-4-5-20251001",
+	}
+
+	for model, want := range tests {
+		if got := mapModelToAnthropic(model); got != want {
+			t.Errorf("mapModelToAnthropic(%q) = %q, want %q", model, got, want)
+		}
 	}
 }
 

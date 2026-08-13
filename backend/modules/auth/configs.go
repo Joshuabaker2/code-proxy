@@ -28,10 +28,12 @@ func (c OAuthConfig) RedirectURI() string {
 // Predefined OAuth configs by provider
 var Configs = map[string]OAuthConfig{
 	"claude": {
-		Provider:     "claude",
-		ClientID:     "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-		AuthURL:      "https://claude.ai/oauth/authorize",
-		TokenURL:     "https://api.anthropic.com/v1/oauth/token",
+		Provider: "claude",
+		ClientID: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+		AuthURL:  "https://claude.ai/oauth/authorize",
+		// Match the token service used by current Claude Code. The access API
+		// remains api.anthropic.com; OAuth code exchange and rotation live here.
+		TokenURL:     "https://platform.claude.com/v1/oauth/token",
 		Scopes:       []string{"org:create_api_key", "user:profile", "user:inference"},
 		CallbackPort: 54545,
 		CallbackPath: "/callback",
