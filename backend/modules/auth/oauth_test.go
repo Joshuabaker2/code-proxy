@@ -3,6 +3,7 @@ package auth
 import (
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -143,4 +144,99 @@ func TestStartFlowReclaimsThePortFromAnEarlierFlow(t *testing.T) {
 	}
 
 	fm.stopCallback(secondID)
+}
+
+func TestParseAuthorizationInput(t *testing.T) {
+	cases := []struct {
+		name      string
+		raw       string
+		code      string
+		state     string
+		wantError bool
+	}{
+		{
+			name:  "full callback url from the address bar",
+			raw:   "http://localhost:54545/callback?code=abc123&state=xyz789",
+			code:  "abc123",
+			state: "xyz789",
+		},
+		{
+			name:  "url whose code carries the state after a hash",
+			raw:   "http://localhost:54545/callback?code=abc123%23xyz789",
+			code:  "abc123",
+			state: "xyz789",
+		},
+		{
+			name:  "bare code",
+			raw:   "abc123",
+			code:  "abc123",
+			state: "",
+		},
+		{
+			name:  "bare code and state joined by a hash",
+			raw:   "abc123#xyz789",
+			code:  "abc123",
+			state: "xyz789",
+		},
+		{
+			name:  "surrounding whitespace from a sloppy paste",
+			raw:   "  http://localhost:54545/callback?code=abc123&state=xyz789\n",
+			code:  "abc123",
+			state: "xyz789",
+		},
+		{
+			name:  "code in the fragment",
+			raw:   "http://localhost:54545/callback#code=abc123&state=xyz789",
+			code:  "abc123",
+			state: "xyz789",
+		},
+		{
+			name:      "provider reported an error",
+			raw:       "http://localhost:54545/callback?error=access_denied",
+			wantError: true,
+		},
+		{
+			name:      "empty",
+			raw:       "   ",
+			wantError: true,
+		},
+		{
+			name:      "url with no code at all",
+			raw:       "http://localhost:54545/callback",
+			wantError: true,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			code, state, err := ParseAuthorizationInput(testCase.raw)
+			if testCase.wantError {
+				if err == nil {
+					t.Fatalf("expected an error, got code=%q state=%q", code, state)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseAuthorizationInput: %v", err)
+			}
+			if code != testCase.code {
+				t.Errorf("code = %q, want %q", code, testCase.code)
+			}
+			if state != testCase.state {
+				t.Errorf("state = %q, want %q", state, testCase.state)
+			}
+		})
+	}
+}
+
+// The pasted value carries the authorization code, so it must never reach an error message.
+func TestParseAuthorizationInputDoesNotEchoTheInput(t *testing.T) {
+	secret := "http://localhost:54545/callback?error=access_denied&code=super-secret-code"
+	_, _, err := ParseAuthorizationInput(secret)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), "super-secret-code") {
+		t.Fatalf("error echoed the authorization code: %v", err)
+	}
 }

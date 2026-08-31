@@ -230,26 +230,9 @@ func (fm *FlowManager) SubmitCallback(flowID, callbackURL string) (*OAuthTokens,
 		return nil, fmt.Errorf("flow %q not found or expired", flowID)
 	}
 
-	// Parse the URL to extract code and state
-	u, err := url.Parse(callbackURL)
+	code, state, err := ParseAuthorizationInput(callbackURL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid callback URL: %w", err)
-	}
-
-	code := u.Query().Get("code")
-	state := u.Query().Get("state")
-
-	// Try fragment if the code wasn't found in the query
-	if code == "" && u.Fragment != "" {
-		vals, _ := url.ParseQuery(u.Fragment)
-		code = vals.Get("code")
-		if state == "" {
-			state = vals.Get("state")
-		}
-	}
-
-	if code == "" {
-		return nil, fmt.Errorf("no authorization code found in URL")
+		return nil, err
 	}
 
 	// Validate state if present
@@ -272,6 +255,48 @@ func (fm *FlowManager) SubmitCallback(flowID, callbackURL string) (*OAuthTokens,
 	fm.mu.Unlock()
 
 	return tokens, nil
+}
+
+// ParseAuthorizationInput extracts the authorization code and state from whatever a
+// person pasted back into the client when the loopback callback was unavailable: the
+// full callback URL out of the address bar, a bare code, or the "code#state" pair
+// Claude hands back. Errors never echo the input, which carries the code itself.
+func ParseAuthorizationInput(raw string) (code, state string, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", fmt.Errorf("no authorization code provided")
+	}
+
+	// A pasted URL parses with a scheme; a bare code does not, and is taken as-is.
+	if u, parseErr := url.Parse(raw); parseErr == nil && u.Scheme != "" {
+		if errParam := u.Query().Get("error"); errParam != "" {
+			return "", "", fmt.Errorf("OAuth error: %s", errParam)
+		}
+		code = u.Query().Get("code")
+		state = u.Query().Get("state")
+		if code == "" && u.Fragment != "" {
+			vals, _ := url.ParseQuery(u.Fragment)
+			code = vals.Get("code")
+			if state == "" {
+				state = vals.Get("state")
+			}
+		}
+	} else {
+		code = raw
+	}
+
+	// Claude appends the state to the code as "code#state".
+	if index := strings.Index(code, "#"); index >= 0 {
+		if state == "" {
+			state = code[index+1:]
+		}
+		code = code[:index]
+	}
+
+	if code == "" {
+		return "", "", fmt.Errorf("no authorization code found in the pasted value")
+	}
+	return code, state, nil
 }
 
 // exchangeCode exchanges an authorization code for tokens
