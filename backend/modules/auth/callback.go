@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,6 +24,8 @@ type CallbackServer struct {
 	port     int
 	resultCh chan CallbackResult
 	server   *http.Server
+	listener net.Listener
+	stopOnce sync.Once
 }
 
 // NewCallbackServer creates a callback server on the specified port
@@ -49,6 +52,7 @@ func (s *CallbackServer) Start() error {
 	if err != nil {
 		return fmt.Errorf("callback server listen: %w", err)
 	}
+	s.listener = ln
 
 	go func() {
 		if err := s.server.Serve(ln); err != nil && err != http.ErrServerClosed {
@@ -139,11 +143,25 @@ func (s *CallbackServer) SubmitCallback(callbackURL string) error {
 	return nil
 }
 
-// Stop shuts down the callback server
+// Stop shuts down the callback server. It is safe to call repeatedly, and on a nil
+// server, so callers do not have to track whether a flow ever started one.
 func (s *CallbackServer) Stop() {
-	if s.server != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		s.server.Shutdown(ctx)
+	if s == nil {
+		return
 	}
+
+	s.stopOnce.Do(func() {
+		// Close the listener here rather than leaving it to Shutdown. Serve closes it
+		// from its own goroutine, so Shutdown can return while the port is still bound
+		// and the next flow loses the race to rebind it — which drops that flow into
+		// manual paste mode for no reason.
+		if s.listener != nil {
+			s.listener.Close()
+		}
+		if s.server != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			s.server.Shutdown(ctx)
+		}
+	})
 }

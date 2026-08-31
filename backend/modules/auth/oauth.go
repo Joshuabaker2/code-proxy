@@ -70,8 +70,12 @@ func (fm *FlowManager) StartFlow(providerName string) (flowID, authURL string, e
 		return "", "", fmt.Errorf("state generation: %w", err)
 	}
 
-	// Start callback server (optional — if it fails, manual paste mode still works)
+	// Start callback server (optional — if it fails, manual paste mode still works).
+	// The port is fixed and process-wide, so at most one flow can own the loopback
+	// listener: release any earlier flow's before claiming it, or a stale flow keeps
+	// the port and every later attempt silently degrades to manual paste mode.
 	if cfg.CallbackPort > 0 {
+		fm.releaseCallbackServers()
 		flow.callback = NewCallbackServer(cfg.CallbackPort)
 		if err := flow.callback.Start(); err != nil {
 			log.Printf("[AUTH] WARNING: callback server failed to start on port %d: %v (manual paste mode only)", cfg.CallbackPort, err)
@@ -103,7 +107,9 @@ func (fm *FlowManager) StartFlow(providerName string) (flowID, authURL string, e
 	// Generate flow ID
 	flowID, err = GenerateState()
 	if err != nil {
-		flow.callback.Stop()
+		if flow.callback != nil {
+			flow.callback.Stop()
+		}
 		return "", "", err
 	}
 	flowID = flowID[:16] // Shorten
@@ -134,40 +140,84 @@ func (fm *FlowManager) StartFlow(providerName string) (flowID, authURL string, e
 func (fm *FlowManager) WaitForCallback(flowID string, timeout time.Duration) (*OAuthTokens, error) {
 	fm.mu.RLock()
 	flow, ok := fm.flows[flowID]
+	var callback *CallbackServer
+	if ok {
+		callback = flow.callback
+	}
 	fm.mu.RUnlock()
 
 	if !ok {
 		return nil, fmt.Errorf("flow %q not found or expired", flowID)
 	}
 
-	if flow.callback == nil {
+	if callback == nil {
 		return nil, fmt.Errorf("callback server not available — use manual mode (paste URL)")
 	}
 
+	// Every exit below releases the listener. It binds a fixed port, so holding it
+	// after a failure blocks the next attempt from ever using automatic mode. The
+	// flow itself stays registered so the caller can still fall back to a manual paste.
 	// Wait for callback
 	result, err := flow.callback.WaitForResult(timeout)
 	if err != nil {
+		fm.stopCallback(flowID)
 		return nil, err
 	}
 
 	// Validate state
 	if result.State != "" && result.State != flow.state {
+		fm.stopCallback(flowID)
 		return nil, fmt.Errorf("state mismatch: expected %s, got %s", flow.state, result.State)
 	}
 
 	// Exchange code for tokens
 	tokens, err := exchangeCode(flow.config, result.Code, flow.verifier, flow.state)
 	if err != nil {
+		fm.stopCallback(flowID)
 		return nil, fmt.Errorf("token exchange: %w", err)
 	}
 
 	// Cleanup
-	flow.callback.Stop()
+	fm.stopCallback(flowID)
 	fm.mu.Lock()
 	delete(fm.flows, flowID)
 	fm.mu.Unlock()
 
 	return tokens, nil
+}
+
+// stopCallback shuts down a flow's callback server and detaches it, freeing the
+// fixed callback port. Safe to call repeatedly and on flows that never had one.
+func (fm *FlowManager) stopCallback(flowID string) {
+	fm.mu.Lock()
+	var callback *CallbackServer
+	if flow, ok := fm.flows[flowID]; ok {
+		callback = flow.callback
+		flow.callback = nil
+	}
+	fm.mu.Unlock()
+
+	if callback != nil {
+		callback.Stop()
+	}
+}
+
+// releaseCallbackServers detaches and shuts down every registered flow's callback
+// server. Servers are stopped outside the lock because Shutdown blocks.
+func (fm *FlowManager) releaseCallbackServers() {
+	fm.mu.Lock()
+	callbacks := make([]*CallbackServer, 0, len(fm.flows))
+	for _, flow := range fm.flows {
+		if flow.callback != nil {
+			callbacks = append(callbacks, flow.callback)
+			flow.callback = nil
+		}
+	}
+	fm.mu.Unlock()
+
+	for _, callback := range callbacks {
+		callback.Stop()
+	}
 }
 
 // SubmitCallback manually submits a callback URL
