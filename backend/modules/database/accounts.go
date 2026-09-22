@@ -1,7 +1,9 @@
 package database
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"time"
 )
 
@@ -168,6 +170,44 @@ func (db *DB) GetAvailableAccounts(providerType string) ([]Account, error) {
 	return scanAccounts(rows)
 }
 
+// EarliestCooldown reports when the soonest active account for providerType
+// leaves cooldown. found is false when the provider has no active accounts at
+// all, which is the genuine "not configured" case and must stay distinct from
+// "every account is briefly cooling down".
+func (db *DB) EarliestCooldown(providerType string) (until time.Time, found bool, err error) {
+	var active int
+	if err := db.conn.QueryRow(
+		`SELECT COUNT(*) FROM accounts WHERE provider_type = ? AND is_active = 1`,
+		providerType,
+	).Scan(&active); err != nil {
+		return time.Time{}, false, err
+	}
+	if active == 0 {
+		return time.Time{}, false, nil
+	}
+
+	// Read the column directly rather than through MIN(), which drops SQLite's
+	// type affinity and hands the driver back a bare string.
+	var cooldown *time.Time
+	err = db.conn.QueryRow(
+		`SELECT cooldown_until FROM accounts
+		 WHERE provider_type = ? AND is_active = 1 AND cooldown_until IS NOT NULL
+		 ORDER BY cooldown_until
+		 LIMIT 1`,
+		providerType,
+	).Scan(&cooldown)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, true, nil
+	}
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if cooldown == nil {
+		return time.Time{}, true, nil
+	}
+	return *cooldown, true, nil
+}
+
 // GetExpiringAccounts returns OAuth accounts that expire soon
 func (db *DB) GetExpiringAccounts(withinDuration time.Duration) ([]Account, error) {
 	threshold := time.Now().Add(withinDuration)
@@ -208,6 +248,16 @@ func (db *DB) SetAccountCooldown(id string, until time.Time, backoffLevel int, l
 	_, err := db.conn.Exec(
 		`UPDATE accounts SET cooldown_until = ?, backoff_level = ?, last_error = ?, updated_at = ? WHERE id = ?`,
 		until, backoffLevel, lastError, time.Now(), id,
+	)
+	return err
+}
+
+// SetAccountLastError records a failure against an account without making it
+// unselectable. Used for failures that are not the account's fault.
+func (db *DB) SetAccountLastError(id string, lastError string) error {
+	_, err := db.conn.Exec(
+		`UPDATE accounts SET last_error = ?, updated_at = ? WHERE id = ?`,
+		lastError, time.Now(), id,
 	)
 	return err
 }

@@ -9,8 +9,32 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 )
+
+// ParseRetryAfter reads an HTTP Retry-After header in either of its forms
+// (delta-seconds or an HTTP date). It returns 0 when the header is absent or
+// unparseable.
+func ParseRetryAfter(header http.Header) time.Duration {
+	value := strings.TrimSpace(header.Get("Retry-After"))
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	if at, err := http.ParseTime(value); err == nil {
+		if wait := time.Until(at); wait > 0 {
+			return wait
+		}
+	}
+	return 0
+}
 
 // proxyExecute is the shared HTTP proxy logic for API providers
 // It receives an OpenAI request, proxies it to the upstream, and returns events
@@ -185,6 +209,9 @@ type ResponseTranslator func(data []byte) ([]byte, error)
 type UpstreamError struct {
 	StatusCode int
 	Body       string
+	// RetryAfter carries the upstream Retry-After hint when one was sent.
+	// Zero means the response did not say.
+	RetryAfter time.Duration
 }
 
 func (e *UpstreamError) Error() string {

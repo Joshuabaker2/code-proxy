@@ -5,7 +5,21 @@ import (
 	"time"
 )
 
-// CooldownForStatus returns the cooldown duration for an HTTP status code
+// backoffDecayWindow is how long after a cooldown expires the accumulated
+// backoff level is still held against an account. Without it the level only
+// ever grows between successes, so a long-lived row eventually sits at the
+// exponential cap permanently.
+const backoffDecayWindow = 10 * time.Minute
+
+// CooldownForStatus returns the cooldown duration for an HTTP status code.
+//
+// Cooldown exists to take an *account* out of rotation, so only account-scoped
+// failures belong here. A zero duration means the failure says nothing about
+// this account's health and must not make it unselectable: upstream 5xx and
+// 529 overload are the provider having a bad moment, and 4xx statuses such as
+// 400 "prompt is too long" or 404 "unknown model" are properties of the
+// request. Cooling the account down for those strands a single-account setup
+// and makes the next Select look like "no account configured".
 func CooldownForStatus(httpStatus int, backoffLevel int) time.Duration {
 	switch httpStatus {
 	case 401:
@@ -16,17 +30,8 @@ func CooldownForStatus(httpStatus int, backoffLevel int) time.Duration {
 		return 30 * time.Minute // Forbidden
 	case 429:
 		return ExponentialBackoff(backoffLevel) // Rate limited
-	case 500, 502:
-		return 10 * time.Second // Server error
-	case 503:
-		return 30 * time.Second // Service unavailable
-	case 504:
-		return 10 * time.Second // Gateway timeout
 	default:
-		if httpStatus >= 400 {
-			return 30 * time.Second
-		}
-		return 5 * time.Second
+		return 0
 	}
 }
 
@@ -40,4 +45,17 @@ func ExponentialBackoff(level int) time.Duration {
 		d = 2 * time.Minute
 	}
 	return d
+}
+
+// decayBackoffLevel drops the stored level back to zero once the previous
+// cooldown has been expired for longer than backoffDecayWindow, so unrelated
+// failures spread over hours do not compound.
+func decayBackoffLevel(level int, cooldownUntil *time.Time, now time.Time) int {
+	if level <= 0 {
+		return 0
+	}
+	if cooldownUntil == nil || now.Sub(*cooldownUntil) > backoffDecayWindow {
+		return 0
+	}
+	return level
 }

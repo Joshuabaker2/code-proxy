@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -23,6 +24,27 @@ const claudeCodeVersion = "2.1.219"
 const claudeCodeBillingVersion = "2.1.219.526"
 
 const anthropicThinkingReplayTTL = time.Hour
+
+// anthropicResponseHeaderTimeout bounds how long we wait for response headers,
+// i.e. time to first byte. It deliberately does NOT bound the body: a streamed
+// completion can legitimately run for many minutes, and http.Client.Timeout
+// would cut it off mid-stream. Without this a stalled large request hangs
+// indefinitely and eventually degrades into an opaque transport error.
+const anthropicResponseHeaderTimeout = 2 * time.Minute
+
+// anthropicHTTPClient replaces http.DefaultClient, which has no timeouts at all.
+var anthropicHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+		ResponseHeaderTimeout: anthropicResponseHeaderTimeout,
+	},
+}
 
 type cachedAnthropicThinking struct {
 	model     string
@@ -188,7 +210,7 @@ func (p *AnthropicAPI) Execute(ctx context.Context, req *Request) (<-chan Event,
 
 	log.Printf("[ANTHROPIC] %s → %s (stream=%v, %d bytes)", req.Model, url, req.Stream, len(claudeBody))
 
-	resp, err := http.DefaultClient.Do(httpReq)
+	resp, err := anthropicHTTPClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("upstream request: %w", err)
 	}
@@ -200,6 +222,7 @@ func (p *AnthropicAPI) Execute(ctx context.Context, req *Request) (<-chan Event,
 		return nil, &UpstreamError{
 			StatusCode: resp.StatusCode,
 			Body:       string(errBody),
+			RetryAfter: ParseRetryAfter(resp.Header),
 		}
 	}
 

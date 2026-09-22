@@ -56,6 +56,33 @@ func (m *Manager) SetTokenRefresher(refresher TokenRefresher) {
 	m.tokenRefresher = refresher
 }
 
+// CoolingDownError reports that the provider has active accounts but every one
+// of them is in cooldown right now. It is deliberately distinct from a nil
+// account, which means "no accounts configured, so this provider needs no
+// auth". Conflating the two turns a transient upstream blip into a bogus
+// "requires a configured account" authentication failure.
+type CoolingDownError struct {
+	ProviderType string
+	Until        time.Time
+}
+
+func (e *CoolingDownError) Error() string {
+	wait := time.Until(e.Until).Round(time.Second)
+	if wait < 0 {
+		wait = 0
+	}
+	return fmt.Sprintf("all %s accounts are cooling down for another %s", e.ProviderType, wait)
+}
+
+// RetryAfter is how long the caller should wait before selecting again.
+func (e *CoolingDownError) RetryAfter() time.Duration {
+	wait := time.Until(e.Until)
+	if wait < 0 {
+		return 0
+	}
+	return wait
+}
+
 // Select picks the next available account for the provider+model
 func (m *Manager) Select(providerType, model string) (*provider.Account, error) {
 	if m.db == nil {
@@ -68,6 +95,15 @@ func (m *Manager) Select(providerType, model string) (*provider.Account, error) 
 	}
 
 	if len(accounts) == 0 {
+		// Nothing is selectable. Either the provider genuinely has no accounts
+		// (works without auth), or they all happen to be in cooldown.
+		until, configured, err := m.db.EarliestCooldown(providerType)
+		if err != nil {
+			return nil, fmt.Errorf("inspect account cooldown: %w", err)
+		}
+		if configured && !until.IsZero() {
+			return nil, &CoolingDownError{ProviderType: providerType, Until: until}
+		}
 		// No accounts configured = provider works without auth
 		return nil, nil
 	}
@@ -101,6 +137,26 @@ func (m *Manager) Select(providerType, model string) (*provider.Account, error) 
 		return nil, fmt.Errorf("refresh expired OAuth account: %w", err)
 	}
 	return refreshed, nil
+}
+
+// Current returns the account this provider would use, ignoring cooldown. Use
+// it for status reporting: an account that is briefly cooling down is still a
+// signed-in account, and reporting it as signed out sends the user off to
+// re-run OAuth for no reason.
+func (m *Manager) Current(providerType string) (*provider.Account, error) {
+	if m.db == nil {
+		return nil, nil
+	}
+	accounts, err := m.db.ListAccounts(providerType)
+	if err != nil {
+		return nil, fmt.Errorf("fetch accounts: %w", err)
+	}
+	for i := range accounts {
+		if accounts[i].IsActive {
+			return dbAccountToProvider(&accounts[i]), nil
+		}
+	}
+	return nil, nil
 }
 
 // RefreshAfterAuthFailure refreshes an account rejected by the upstream API.
@@ -183,8 +239,15 @@ func (m *Manager) ReportSuccess(accountID, model string) {
 	m.db.ClearAccountCooldown(accountID)
 }
 
-// ReportError applies cooldown with exponential backoff
-func (m *Manager) ReportError(accountID, model string, httpStatus int, errText string) {
+// ReportError records a failed request against an account and applies a
+// cooldown when the failure is account-scoped. retryAfter carries the upstream
+// Retry-After hint when there was one; pass 0 when there was not.
+//
+// Failures that say nothing about the account's health (upstream 5xx, 529
+// overload, request-shaped 4xx) are recorded as last_error but leave the
+// account selectable. Taking the only account out of rotation for those turns
+// a transient blip into a bogus "requires a configured account" error.
+func (m *Manager) ReportError(accountID, model string, httpStatus int, retryAfter time.Duration, errText string) {
 	if m.db == nil {
 		return
 	}
@@ -194,9 +257,24 @@ func (m *Manager) ReportError(accountID, model string, httpStatus int, errText s
 		return
 	}
 
-	duration := CooldownForStatus(httpStatus, acct.BackoffLevel)
-	until := time.Now().Add(duration)
-	newLevel := acct.BackoffLevel + 1
+	now := time.Now()
+	level := decayBackoffLevel(acct.BackoffLevel, acct.CooldownUntil, now)
+	duration := CooldownForStatus(httpStatus, level)
+	// An explicit upstream Retry-After beats our guess, but only for statuses
+	// we already consider account-scoped.
+	if duration > 0 && retryAfter > duration {
+		duration = retryAfter
+	}
+
+	if duration <= 0 {
+		log.Printf("[ACCOUNT] Error %s: status=%d (no cooldown; not account-scoped)",
+			accountID[:8], httpStatus)
+		m.db.SetAccountLastError(accountID, errText)
+		return
+	}
+
+	until := now.Add(duration)
+	newLevel := level + 1
 
 	log.Printf("[ACCOUNT] Cooldown %s: status=%d, duration=%s, level=%d",
 		accountID[:8], httpStatus, duration, newLevel)

@@ -1,12 +1,15 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +19,63 @@ import (
 )
 
 const maxRetries = 3
+
+// maxRetryWait caps how long a single request will block waiting for a
+// cooldown or backoff to elapse. Anything longer is handed back to the client
+// as a 503 with Retry-After instead of holding the connection open.
+const maxRetryWait = 15 * time.Second
+
+// upstreamRetryAfter returns the Retry-After hint carried by an upstream
+// error, or 0 when the response did not send one.
+func upstreamRetryAfter(err error) time.Duration {
+	var upstreamErr *provider.UpstreamError
+	if errors.As(err, &upstreamErr) {
+		return upstreamErr.RetryAfter
+	}
+	return 0
+}
+
+// retryBackoff is how long to wait before the next attempt. Retrying with no
+// delay at all cannot outlast even the shortest cooldown, which is how a
+// transient upstream blip used to turn into "requires a configured account".
+func retryBackoff(attempt int, hint time.Duration) time.Duration {
+	if hint > 0 {
+		return hint
+	}
+	return time.Duration(1<<uint(attempt)) * time.Second
+}
+
+// waitBeforeRetry blocks for wait. It reports false when the wait is longer
+// than the budget or the client went away, meaning the caller should give up
+// rather than retry.
+func waitBeforeRetry(ctx context.Context, wait time.Duration) bool {
+	if wait <= 0 {
+		return true
+	}
+	if wait > maxRetryWait {
+		return false
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// writeRetryAfter advertises when the client may try again.
+func writeRetryAfter(w http.ResponseWriter, wait time.Duration) {
+	if wait <= 0 {
+		return
+	}
+	seconds := int(math.Ceil(wait.Seconds()))
+	if seconds < 1 {
+		seconds = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(seconds))
+}
 
 // handleChat handles POST /v1/chat/completions (OpenAI-compatible)
 func handleChat(registry *provider.Registry, acctMgr *account.Manager, defaultModel string, db *database.DB) http.HandlerFunc {
@@ -109,6 +169,14 @@ func executeSingleModelForCombo(w http.ResponseWriter, r *http.Request, body []b
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		acct, err := acctMgr.Select(providerType, cleanModel)
 		if err != nil {
+			// All accounts cooling down: wait it out if it is short, otherwise
+			// let the combo move on to the next model.
+			var coolingDown *account.CoolingDownError
+			if errors.As(err, &coolingDown) {
+				if attempt < maxRetries-1 && waitBeforeRetry(r.Context(), coolingDown.RetryAfter()) {
+					continue
+				}
+			}
 			return fmt.Errorf("no available account: %w", err)
 		}
 
@@ -123,6 +191,7 @@ func executeSingleModelForCombo(w http.ResponseWriter, r *http.Request, body []b
 		events, err := p.Execute(r.Context(), provReq)
 		if err != nil {
 			status := providerErrorStatus(err)
+			hint := upstreamRetryAfter(err)
 			if status == http.StatusUnauthorized && !authRecoveryAttempted && acct != nil {
 				authRecoveryAttempted = true
 				if _, refreshErr := acctMgr.RefreshAfterAuthFailure(acct); refreshErr == nil {
@@ -133,19 +202,19 @@ func executeSingleModelForCombo(w http.ResponseWriter, r *http.Request, body []b
 				}
 			}
 			if acct != nil {
-				acctMgr.ReportError(acct.ID, cleanModel, status, err.Error())
+				acctMgr.ReportError(acct.ID, cleanModel, status, hint, err.Error())
 			}
 			if status >= 400 && status < 500 {
+				return err
+			}
+			if attempt < maxRetries-1 && !waitBeforeRetry(r.Context(), retryBackoff(attempt, hint)) {
 				return err
 			}
 			continue
 		}
 
-		// Success
-		if acct != nil {
-			acctMgr.ReportSuccess(acct.ID, cleanModel)
-		}
-
+		// Headers are on the wire now; the response still has to survive the
+		// stream before it counts as a success.
 		accountID := ""
 		if acct != nil {
 			accountID = acct.ID
@@ -153,12 +222,21 @@ func executeSingleModelForCombo(w http.ResponseWriter, r *http.Request, body []b
 
 		var tokenUsage requestTokenUsage
 		var cost float64
+		var outcome streamOutcome
 		if req.Stream {
-			tokenUsage, cost = streamResponse(w, events, cleanModel, req.Model)
+			tokenUsage, cost, outcome = streamResponse(w, events, cleanModel, req.Model)
 		} else {
-			tokenUsage, cost = nonStreamResponse(w, events, cleanModel, req.Model)
+			tokenUsage, cost, outcome = nonStreamResponse(w, events, cleanModel, req.Model)
 		}
 		tokenUsage = tokenUsage.forLogging(inputTokens)
+
+		if acct != nil {
+			if outcome.failed {
+				acctMgr.ReportError(acct.ID, cleanModel, http.StatusBadGateway, 0, outcome.reason)
+			} else {
+				acctMgr.ReportSuccess(acct.ID, cleanModel)
+			}
+		}
 
 		if db != nil {
 			durationMs := time.Since(startTime).Milliseconds()
@@ -200,10 +278,31 @@ func executeSingleModel(w http.ResponseWriter, r *http.Request, body []byte, req
 
 	var lastErr error
 	lastStatus := http.StatusInternalServerError
+	var lastRetryAfter time.Duration
 	authRecoveryAttempted := false
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		acct, err := acctMgr.Select(providerType, model)
 		if err != nil {
+			// Every account is briefly cooling down. This is NOT "no account
+			// configured" — never let it reach the provider as a nil account,
+			// which would report a bogus authentication failure.
+			var coolingDown *account.CoolingDownError
+			if errors.As(err, &coolingDown) {
+				wait := coolingDown.RetryAfter()
+				if attempt < maxRetries-1 && waitBeforeRetry(r.Context(), wait) {
+					continue
+				}
+				// Out of budget. Report the failure that caused the cooldown
+				// if we have it, rather than the cooldown itself.
+				if lastErr == nil {
+					lastErr = err
+					lastStatus = http.StatusServiceUnavailable
+				}
+				if lastRetryAfter <= 0 {
+					lastRetryAfter = wait
+				}
+				break
+			}
 			log.Printf("[CHAT] Account select error: %v", err)
 			writeError(w, "No available account: "+err.Error(), http.StatusServiceUnavailable)
 			return
@@ -221,6 +320,7 @@ func executeSingleModel(w http.ResponseWriter, r *http.Request, body []byte, req
 		if err != nil {
 			log.Printf("[CHAT] Execute error (attempt %d): %v", attempt+1, err)
 			status := providerErrorStatus(err)
+			hint := upstreamRetryAfter(err)
 			if status == http.StatusUnauthorized && !authRecoveryAttempted && acct != nil {
 				authRecoveryAttempted = true
 				if _, refreshErr := acctMgr.RefreshAfterAuthFailure(acct); refreshErr == nil {
@@ -231,21 +331,24 @@ func executeSingleModel(w http.ResponseWriter, r *http.Request, body []byte, req
 				}
 			}
 			if acct != nil {
-				acctMgr.ReportError(acct.ID, model, status, err.Error())
+				acctMgr.ReportError(acct.ID, model, status, hint, err.Error())
 			}
+			// Keep the real failure so the client is told what actually went
+			// wrong, not whatever a later attempt happened to produce.
 			lastErr = err
 			lastStatus = status
+			lastRetryAfter = hint
 			if status >= 400 && status < 500 {
+				break
+			}
+			if attempt < maxRetries-1 && !waitBeforeRetry(r.Context(), retryBackoff(attempt, hint)) {
 				break
 			}
 			continue
 		}
 
-		// Success — report and serve response
-		if acct != nil {
-			acctMgr.ReportSuccess(acct.ID, model)
-		}
-
+		// Headers are on the wire now; the response still has to survive the
+		// stream before it counts as a success.
 		accountID := ""
 		if acct != nil {
 			accountID = acct.ID
@@ -253,12 +356,23 @@ func executeSingleModel(w http.ResponseWriter, r *http.Request, body []byte, req
 
 		var tokenUsage requestTokenUsage
 		var cost float64
+		var outcome streamOutcome
 		if req.Stream {
-			tokenUsage, cost = streamResponse(w, events, model, req.Model)
+			tokenUsage, cost, outcome = streamResponse(w, events, model, req.Model)
 		} else {
-			tokenUsage, cost = nonStreamResponse(w, events, model, req.Model)
+			tokenUsage, cost, outcome = nonStreamResponse(w, events, model, req.Model)
 		}
 		tokenUsage = tokenUsage.forLogging(inputTokens)
+
+		if acct != nil {
+			if outcome.failed {
+				// Too late to change the HTTP status on a stream, but this must
+				// not clear the account's backoff or count as a clean request.
+				acctMgr.ReportError(acct.ID, model, http.StatusBadGateway, 0, outcome.reason)
+			} else {
+				acctMgr.ReportSuccess(acct.ID, model)
+			}
+		}
 
 		// Log the request
 		if db != nil {
@@ -283,6 +397,7 @@ func executeSingleModel(w http.ResponseWriter, r *http.Request, body []byte, req
 	if lastErr != nil {
 		errMsg = lastErr.Error()
 	}
+	writeRetryAfter(w, lastRetryAfter)
 	writeError(w, errMsg, lastStatus)
 }
 
@@ -331,7 +446,17 @@ func extractResponseUsage(jsonStr string) (requestTokenUsage, bool) {
 
 // streamResponse streams SSE events and returns actual token usage when the
 // provider reports it, falling back to output-text estimation otherwise.
-func streamResponse(w http.ResponseWriter, events <-chan provider.Event, model string, originalModel string) (requestTokenUsage, float64) {
+// streamOutcome reports whether a response actually completed. A stream that
+// ended in an upstream error, or simply stopped mid-message, must not be
+// treated as a success: that clears the account's backoff, logs the request as
+// good, and — worst of all — hands the caller a truncated answer wearing a
+// clean finish_reason.
+type streamOutcome struct {
+	failed bool
+	reason string
+}
+
+func streamResponse(w http.ResponseWriter, events <-chan provider.Event, model string, originalModel string) (requestTokenUsage, float64, streamOutcome) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -339,7 +464,7 @@ func streamResponse(w http.ResponseWriter, events <-chan provider.Event, model s
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
-		return requestTokenUsage{}, 0
+		return requestTokenUsage{}, 0, streamOutcome{failed: true, reason: "streaming not supported"}
 	}
 
 	chatID := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
@@ -401,7 +526,7 @@ func streamResponse(w http.ResponseWriter, events <-chan provider.Event, model s
 			if !tokenUsage.Actual {
 				tokenUsage.OutputTokens = totalText / 4
 			}
-			return tokenUsage, cost
+			return tokenUsage, cost, streamOutcome{}
 
 		case "error":
 			log.Printf("[CHAT] Stream error: %s", event.Text)
@@ -409,36 +534,43 @@ func streamResponse(w http.ResponseWriter, events <-chan provider.Event, model s
 			if !tokenUsage.Actual {
 				tokenUsage.OutputTokens = totalText / 4
 			}
-			return tokenUsage, cost
+			return tokenUsage, cost, streamOutcome{failed: true, reason: event.Text}
 		}
 	}
 
-	// Stream ended without done event
-	if !sentRole {
-		sendSSE(w, flusher, ChatResponse{
-			ID: chatID, Object: "chat.completion.chunk", Created: created, Model: originalModel,
-			Choices: []Choice{{Index: 0, Delta: &Delta{Role: "assistant", Content: "(no response)"}}},
-		})
-	}
-	sendSSE(w, flusher, ChatResponse{
-		ID: chatID, Object: "chat.completion.chunk", Created: created, Model: originalModel,
-		Choices: []Choice{{Index: 0, Delta: &Delta{}, FinishReason: "stop"}},
-	})
-	fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
+	// The event channel closed without a done event.
 	if !tokenUsage.Actual {
 		tokenUsage.OutputTokens = totalText / 4
 	}
-	return tokenUsage, cost
+
+	// If the upstream already signalled completion in-band, this is a clean
+	// end and there is nothing more to say.
+	if sentFinish {
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
+		return tokenUsage, cost, streamOutcome{}
+	}
+
+	// Otherwise the connection ended mid-message. Synthesizing finish_reason
+	// "stop" here would dress a truncated answer up as a complete one, which
+	// on a long tool-calling run is silently wrong rather than loudly broken.
+	reason := "upstream stream ended before the message was complete"
+	if !sentRole {
+		reason = "upstream stream closed without returning any content"
+	}
+	log.Printf("[CHAT] Truncated stream for %s: %s (%d bytes of text)", model, reason, totalText)
+	sendSSEError(w, flusher, reason)
+	return tokenUsage, cost, streamOutcome{failed: true, reason: reason}
 }
 
 // nonStreamResponse collects all events and returns a complete response
-func nonStreamResponse(w http.ResponseWriter, events <-chan provider.Event, model string, originalModel string) (requestTokenUsage, float64) {
+func nonStreamResponse(w http.ResponseWriter, events <-chan provider.Event, model string, originalModel string) (requestTokenUsage, float64, streamOutcome) {
 	w.Header().Set("Content-Type", "application/json")
 
 	var fullText strings.Builder
 	var fullJSON string
 	var cost float64
+	var streamErr string
 
 	for event := range events {
 		switch event.Type {
@@ -450,7 +582,19 @@ func nonStreamResponse(w http.ResponseWriter, events <-chan provider.Event, mode
 			if event.Cost > 0 {
 				cost = event.Cost
 			}
+		case "error":
+			// Previously dropped on the floor, so an upstream failure came back
+			// as a 200 with whatever partial text had arrived.
+			streamErr = event.Text
 		}
+	}
+
+	// Nothing has been written yet on this path, so unlike the streaming case
+	// we can still answer with an honest status.
+	if streamErr != "" {
+		log.Printf("[CHAT] Stream error (non-streaming) for %s: %s", model, streamErr)
+		writeError(w, streamErr, http.StatusBadGateway)
+		return requestTokenUsage{}, cost, streamOutcome{failed: true, reason: streamErr}
 	}
 
 	response := fullText.String()
@@ -466,7 +610,7 @@ func nonStreamResponse(w http.ResponseWriter, events <-chan provider.Event, mode
 				if !ok {
 					tokenUsage.OutputTokens = outputTokens
 				}
-				return tokenUsage, cost
+				return tokenUsage, cost, streamOutcome{}
 			}
 		}
 	}
@@ -491,7 +635,7 @@ func nonStreamResponse(w http.ResponseWriter, events <-chan provider.Event, mode
 	}
 
 	json.NewEncoder(w).Encode(resp)
-	return requestTokenUsage{OutputTokens: outputTokens}, cost
+	return requestTokenUsage{OutputTokens: outputTokens}, cost, streamOutcome{}
 }
 
 func sendSSE(w http.ResponseWriter, flusher http.Flusher, chunk ChatResponse) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -308,9 +309,19 @@ func mergeClaudeModelCatalogs(catalogs ...[]provider.Model) []provider.Model {
 func (s *EmbeddedServer) embeddedAuthStatus() (EmbeddedAuthStatus, error) {
 	selected, err := s.accountMgr.Select("anthropic-api", "")
 	if err != nil {
-		// A stored row is not an authenticated session if its expired token can
-		// no longer be refreshed. Report signed-out so the client can reconnect.
-		return EmbeddedAuthStatus{}, nil
+		var coolingDown *account.CoolingDownError
+		if !errors.As(err, &coolingDown) {
+			// A stored row is not an authenticated session if its expired token
+			// can no longer be refreshed. Report signed-out so the client can
+			// reconnect.
+			return EmbeddedAuthStatus{}, nil
+		}
+		// A cooling-down account is still signed in. Reporting it as signed out
+		// would push the user into a pointless reconnect.
+		selected, err = s.accountMgr.Current("anthropic-api")
+		if err != nil {
+			return EmbeddedAuthStatus{}, nil
+		}
 	}
 	if selected == nil || !selected.IsActive || selected.AuthMode != "oauth" || selected.AccessToken == "" {
 		return EmbeddedAuthStatus{}, nil
