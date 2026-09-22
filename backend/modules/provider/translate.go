@@ -838,13 +838,19 @@ func mapModelToAnthropic(model string) string {
 		return model
 	}
 
-	// Map short names
+	// Short family names follow the catalog's newest release rather than a
+	// pinned ID, so they track new Claude drops with the rest of the proxy.
+	family := "sonnet"
 	switch {
+	case strings.Contains(lower, "fable"):
+		family = "fable"
 	case strings.Contains(lower, "opus"):
-		return "claude-opus-4-6"
+		family = "opus"
 	case strings.Contains(lower, "haiku"):
-		return "claude-haiku-4-5-20251001"
-	default:
-		return "claude-sonnet-4-6"
+		family = "haiku"
 	}
+	if id, ok := NewestClaudeModelID(family, ClaudeOAuthModels()); ok {
+		return id
+	}
+	return "claude-sonnet-5"
 }

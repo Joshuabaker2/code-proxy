@@ -157,9 +157,13 @@ func TestTranslateOpenAIToAnthropicDoesNotEnableAdaptiveThinkingForHaiku45(t *te
 
 func TestMapModelToAnthropicUsesCanonicalModelIDs(t *testing.T) {
 	tests := map[string]string{
-		"sonnet": "claude-sonnet-4-6",
-		"opus":   "claude-opus-4-6",
-		"haiku":  "claude-haiku-4-5-20251001",
+		"sonnet":                   "claude-sonnet-5",
+		"opus":                     "claude-opus-5-5",
+		"haiku":                    "claude-haiku-4-5",
+		"fable":                    "claude-fable-5-1",
+		"claude-opus-4-6":          "claude-opus-4-6",
+		"claude-sonnet-5-2":        "claude-sonnet-5-2",
+		"claude-fable-5-1-preview": "claude-fable-5-1-preview",
 	}
 
 	for model, want := range tests {

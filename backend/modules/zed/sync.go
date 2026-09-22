@@ -76,24 +76,7 @@ func CodeProxyModels(catalog []provider.Model) []Model {
 }
 
 func supportsClaudeEffort(modelID string) bool {
-	modelID = strings.ToLower(strings.TrimPrefix(modelID, "cc/"))
-	for _, family := range []string{
-		"claude-fable-5",
-		"claude-mythos-5",
-		"claude-mythos-preview",
-		"claude-opus-4-5",
-		"claude-opus-4-6",
-		"claude-opus-4-7",
-		"claude-opus-4-8",
-		"claude-opus-5",
-		"claude-sonnet-4-6",
-		"claude-sonnet-5",
-	} {
-		if strings.HasPrefix(modelID, family) {
-			return true
-		}
-	}
-	return false
+	return provider.ClaudeSupportsEffort(modelID)
 }
 
 // DefaultSettingsPath returns Zed's default settings path on macOS and Linux.

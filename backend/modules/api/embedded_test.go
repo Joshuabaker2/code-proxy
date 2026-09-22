@@ -81,7 +81,7 @@ func TestEmbeddedModelsUseTheClaudeOAuthCatalog(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &models); err != nil {
 		t.Fatalf("decode models: %v", err)
 	}
-	want := []string{"claude-opus-5", "claude-sonnet-5", "claude-fable-5"}
+	want := []string{"claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5", "claude-haiku-4-5"}
 	if len(models.Data) != len(want) {
 		t.Fatalf("models = %#v, want %v", models.Data, want)
 	}
@@ -97,14 +97,15 @@ func TestMergeClaudeModelCatalogsKeepsStableAliasesFirst(t *testing.T) {
 	discovered := []provider.Model{
 		{ID: "cc/claude-opus-4-6", Name: "Claude Opus 4.6"},
 		{ID: "cc/claude-sonnet-4-6", Name: "Claude Sonnet 4.6"},
-		{ID: "cc/claude-opus-5", Name: "duplicate"},
+		{ID: "cc/claude-opus-5-5", Name: "duplicate"},
 	}
 
 	got := mergeClaudeModelCatalogs(stable, discovered)
 	want := []string{
-		"cc/claude-opus-5",
+		"cc/claude-fable-5-1",
+		"cc/claude-opus-5-5",
 		"cc/claude-sonnet-5",
-		"cc/claude-fable-5",
+		"cc/claude-haiku-4-5",
 		"cc/claude-opus-4-6",
 		"cc/claude-sonnet-4-6",
 	}

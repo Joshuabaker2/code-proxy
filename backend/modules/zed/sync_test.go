@@ -39,7 +39,7 @@ func TestReplaceModelsPreservesJSONCAndOtherSettings(t *testing.T) {
 		"// user comment",
 		"// managed by Code Proxy",
 		`"theme": "Keep Me"`,
-		`"name": "cc/claude-opus-5"`,
+		`"name": "cc/claude-opus-5-5"`,
 		`"max_tokens": 1000000`,
 		`"max_output_tokens": 128000`,
 		`"reasoning_effort": "high"`,
