@@ -154,3 +154,35 @@ func TestWellFormedHistoryIsUnchangedByTheRepair(t *testing.T) {
 		t.Fatalf("answer turn = %v, want exactly the real result", blocks)
 	}
 }
+
+// Anthropic only recognises tool results at the front of the user turn. Goose
+// can fold a queued user message in ahead of the tool response; the repair
+// must move the results first rather than forward the client's order.
+func TestUserTextAheadOfToolResultIsReorderedBehindIt(t *testing.T) {
+	messages := translateMessages(t, `[
+		{"role":"user","content":"start"},
+		`+assistantCallsAB+`,
+		{"role":"user","content":"while you work: also check the T4"},
+		`+toolResultA+`,
+		`+toolResultB+`
+	]`)
+
+	if len(messages) != 3 {
+		t.Fatalf("expected user, assistant, user; got %d messages", len(messages))
+	}
+	blocks := blocksOf(t, messages[2])
+	if len(blocks) != 3 {
+		t.Fatalf("expected two results and one text block, got %v", blocks)
+	}
+	for index, want := range []string{"call_A", "call_B"} {
+		if blocks[index]["type"] != "tool_result" || blocks[index]["tool_use_id"] != want {
+			t.Fatalf("block %d should be the result for %s, got %v", index, want, blocks[index])
+		}
+		if _, isError := blocks[index]["is_error"]; isError {
+			t.Fatalf("real result for %s was replaced by a synthetic error: %v", want, blocks[index])
+		}
+	}
+	if blocks[2]["type"] != "text" || !strings.Contains(blocks[2]["text"].(string), "T4") {
+		t.Fatalf("user text should follow the results, got %v", blocks[2])
+	}
+}

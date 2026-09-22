@@ -231,6 +231,11 @@ func (p *AnthropicAPI) Execute(ctx context.Context, req *Request) (<-chan Event,
 			learnClaudeCodeVersionRequirement(string(errBody)) {
 			continue
 		}
+		if resp.StatusCode == http.StatusBadRequest && strings.Contains(string(errBody), "tool_result") {
+			// The pairing repair should make this impossible; when it is not,
+			// the outline is the only evidence that survives the failed turn.
+			log.Printf("[ANTHROPIC] Upstream rejected message pairing; request outline:\n%s", describeMessageShape(claudeBody))
+		}
 		return nil, &UpstreamError{
 			StatusCode: resp.StatusCode,
 			Body:       string(errBody),

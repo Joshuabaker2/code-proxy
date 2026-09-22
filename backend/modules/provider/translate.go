@@ -647,7 +647,12 @@ func repairToolPairing(messages []map[string]any) []map[string]any {
 			out = append(out, msg)
 
 		case "user":
-			var kept []map[string]any
+			// Anthropic reads tool results only from the front of the user turn:
+			// a text block ahead of a tool_result makes the call look unanswered
+			// ("tool_use ids were found without tool_result blocks immediately
+			// after"). Clients such as Goose can fold a queued user message in
+			// before the tool response, so order the results first ourselves.
+			var results, rest []map[string]any
 			for _, block := range contentBlocks(msg["content"]) {
 				if block["type"] == "tool_result" {
 					id, _ := block["tool_use_id"].(string)
@@ -656,12 +661,14 @@ func repairToolPairing(messages []map[string]any) []map[string]any {
 						continue
 					}
 					answered[id] = true
+					results = append(results, block)
+					continue
 				}
-				kept = append(kept, block)
+				rest = append(rest, block)
 			}
-			// Anthropic wants the results first; anything the client did not
-			// answer gets an explicit error result ahead of the rest.
-			content := append(unanswered(), kept...)
+			// Anything the client did not answer gets an explicit error result
+			// ahead of the rest.
+			content := append(append(unanswered(), results...), rest...)
 			if len(content) == 0 {
 				continue
 			}
