@@ -3,6 +3,7 @@ package provider
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 )
@@ -134,7 +135,7 @@ func translateOpenAIToAnthropic(
 	if len(systemParts) > 0 {
 		claude["system"] = strings.Join(systemParts, "\n\n")
 	}
-	claude["messages"] = claudeMessages
+	claude["messages"] = repairToolPairing(claudeMessages)
 
 	// Convert tools
 	if openAI.Tools != nil {
@@ -591,6 +592,144 @@ func convertContentPart(part map[string]any) map[string]any {
 			"media_type": mediaType,
 			"data":       data,
 		},
+	}
+}
+
+// repairToolPairing enforces Anthropic's pairing rule on a translated message
+// list: every tool_use block in an assistant turn must be answered by a
+// tool_result block in the very next user turn, and no tool_result may refer
+// to a tool_use that is not there. OpenAI-shaped clients such as Goose have no
+// such rule, so a cancelled tool call, a stream that died mid tool-call, or a
+// retry that replays a partial assistant turn hands us a history Anthropic
+// rejects outright ("tool_use ids were found without tool_result blocks
+// immediately after"). Rather than fail the whole request, answer the orphaned
+// calls with an explicit error result and drop results nothing asked for.
+//
+// Consecutive user messages are merged first: OpenAI clients send one message
+// per tool result, and Anthropic treats a run of user messages as one turn.
+func repairToolPairing(messages []map[string]any) []map[string]any {
+	messages = mergeConsecutiveUserMessages(messages)
+
+	var out []map[string]any
+	answered := map[string]bool{}
+	var pendingOrder []string
+	dropped := 0
+
+	unanswered := func() []map[string]any {
+		var blocks []map[string]any
+		for _, id := range pendingOrder {
+			if !answered[id] {
+				blocks = append(blocks, syntheticToolResult(id))
+			}
+		}
+		pendingOrder = nil
+		answered = map[string]bool{}
+		return blocks
+	}
+
+	for _, msg := range messages {
+		role, _ := msg["role"].(string)
+		switch role {
+		case "assistant":
+			if missing := unanswered(); len(missing) > 0 {
+				// The previous assistant turn's calls were never answered and the
+				// conversation moved on; answer them before it does.
+				out = append(out, map[string]any{"role": "user", "content": missing})
+			}
+			for _, block := range contentBlocks(msg["content"]) {
+				if block["type"] == "tool_use" {
+					if id, ok := block["id"].(string); ok && id != "" {
+						pendingOrder = append(pendingOrder, id)
+						answered[id] = false
+					}
+				}
+			}
+			out = append(out, msg)
+
+		case "user":
+			var kept []map[string]any
+			for _, block := range contentBlocks(msg["content"]) {
+				if block["type"] == "tool_result" {
+					id, _ := block["tool_use_id"].(string)
+					if _, expected := answered[id]; !expected {
+						dropped++
+						continue
+					}
+					answered[id] = true
+				}
+				kept = append(kept, block)
+			}
+			// Anthropic wants the results first; anything the client did not
+			// answer gets an explicit error result ahead of the rest.
+			content := append(unanswered(), kept...)
+			if len(content) == 0 {
+				continue
+			}
+			out = append(out, map[string]any{"role": "user", "content": content})
+
+		default:
+			out = append(out, msg)
+		}
+	}
+
+	if missing := unanswered(); len(missing) > 0 {
+		// The history ends on the assistant's own tool call with nothing after it.
+		out = append(out, map[string]any{"role": "user", "content": missing})
+	}
+	if dropped > 0 {
+		log.Printf("[TRANSLATE] Dropped %d tool_result block(s) with no matching tool_use", dropped)
+	}
+	return out
+}
+
+func syntheticToolResult(toolUseID string) map[string]any {
+	return map[string]any{
+		"type":        "tool_result",
+		"tool_use_id": toolUseID,
+		"is_error":    true,
+		"content":     "No result was recorded for this tool call. Treat it as failed; if the information is still needed, call the tool again.",
+	}
+}
+
+// mergeConsecutiveUserMessages folds runs of user messages into one so that
+// pairing can be judged per turn, the way Anthropic judges it.
+func mergeConsecutiveUserMessages(messages []map[string]any) []map[string]any {
+	var out []map[string]any
+	for _, msg := range messages {
+		role, _ := msg["role"].(string)
+		if role == "user" && len(out) > 0 {
+			if prev := out[len(out)-1]; prev["role"] == "user" {
+				merged := append(contentBlocks(prev["content"]), contentBlocks(msg["content"])...)
+				out[len(out)-1] = map[string]any{"role": "user", "content": merged}
+				continue
+			}
+		}
+		out = append(out, msg)
+	}
+	return out
+}
+
+// contentBlocks normalizes a message's content to a block list: a bare string
+// becomes one text block, a block list is returned as is.
+func contentBlocks(content any) []map[string]any {
+	switch typed := content.(type) {
+	case string:
+		if typed == "" {
+			return nil
+		}
+		return []map[string]any{{"type": "text", "text": typed}}
+	case []map[string]any:
+		return typed
+	case []any:
+		blocks := make([]map[string]any, 0, len(typed))
+		for _, item := range typed {
+			if block, ok := item.(map[string]any); ok {
+				blocks = append(blocks, block)
+			}
+		}
+		return blocks
+	default:
+		return nil
 	}
 }
 
