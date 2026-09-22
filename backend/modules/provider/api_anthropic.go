@@ -20,8 +20,6 @@ import (
 
 const anthropicBaseURL = "https://api.anthropic.com"
 const anthropicVersion = "2023-06-01"
-const claudeCodeVersion = "2.1.219"
-const claudeCodeBillingVersion = "2.1.219.526"
 
 const anthropicThinkingReplayTTL = time.Hour
 
@@ -93,7 +91,7 @@ func DiscoverClaudeOAuthModels(ctx context.Context, accessToken string) ([]Model
 	httpReq.Header.Set("Accept", "application/json")
 	httpReq.Header.Set("anthropic-version", anthropicVersion)
 	httpReq.Header.Set("anthropic-beta", "oauth-2025-04-20,claude-code-20250219")
-	httpReq.Header.Set("User-Agent", "claude-cli/"+claudeCodeVersion+" (external, sdk-cli)")
+	httpReq.Header.Set("User-Agent", "claude-cli/"+claudeCodeVersion()+" (external, sdk-cli)")
 	httpReq.Header.Set("x-app", "cli")
 	httpReq.Header.Set("anthropic-dangerous-direct-browser-access", "true")
 
@@ -175,50 +173,64 @@ func (p *AnthropicAPI) Execute(ctx context.Context, req *Request) (<-chan Event,
 		return nil, fmt.Errorf("apply Claude effort: %w", err)
 	}
 
-	var claudeCodeSessionID string
-	if req.Account.AuthMode == "oauth" && req.Account.AccessToken != "" {
-		claudeBody, claudeCodeSessionID, err = prepareClaudeCodeOAuthBody(claudeBody, req.Account.ID)
-		if err != nil {
-			return nil, fmt.Errorf("prepare claude oauth request: %w", err)
+	oauth := req.Account.AuthMode == "oauth" && req.Account.AccessToken != ""
+	translatedBody := claudeBody
+
+	var resp *http.Response
+	// One retry: when Anthropic rejects the presented Claude Code version, the
+	// rejection names the version it wants. Adopt it and resend rather than
+	// surfacing a failure that a newer client would not have hit.
+	for attempt := 0; ; attempt++ {
+		claudeBody = translatedBody
+		var claudeCodeSessionID string
+		if oauth {
+			claudeBody, claudeCodeSessionID, err = prepareClaudeCodeOAuthBody(translatedBody, req.Account.ID)
+			if err != nil {
+				return nil, fmt.Errorf("prepare claude oauth request: %w", err)
+			}
 		}
-	}
 
-	// Build HTTP request
-	url := anthropicBaseURL + "/v1/messages"
-	if claudeCodeSessionID != "" {
-		url += "?beta=true"
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(claudeBody))
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
+		// Build HTTP request
+		url := anthropicBaseURL + "/v1/messages"
+		if claudeCodeSessionID != "" {
+			url += "?beta=true"
+		}
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(claudeBody))
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
 
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("anthropic-version", anthropicVersion)
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("anthropic-version", anthropicVersion)
 
-	// Auth: OAuth token (Bearer) or API key (x-api-key)
-	if req.Account.AuthMode == "oauth" && req.Account.AccessToken != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+req.Account.AccessToken)
-		httpReq.Header.Set("anthropic-beta", "oauth-2025-04-20,claude-code-20250219")
-		httpReq.Header.Set("User-Agent", "claude-cli/"+claudeCodeVersion+" (external, sdk-cli)")
-		httpReq.Header.Set("x-app", "cli")
-		httpReq.Header.Set("anthropic-dangerous-direct-browser-access", "true")
-		httpReq.Header.Set("x-claude-code-session-id", claudeCodeSessionID)
-	} else {
-		httpReq.Header.Set("x-api-key", req.Account.AuthToken())
-	}
+		// Auth: OAuth token (Bearer) or API key (x-api-key)
+		if oauth {
+			httpReq.Header.Set("Authorization", "Bearer "+req.Account.AccessToken)
+			httpReq.Header.Set("anthropic-beta", "oauth-2025-04-20,claude-code-20250219")
+			httpReq.Header.Set("User-Agent", "claude-cli/"+claudeCodeVersion()+" (external, sdk-cli)")
+			httpReq.Header.Set("x-app", "cli")
+			httpReq.Header.Set("anthropic-dangerous-direct-browser-access", "true")
+			httpReq.Header.Set("x-claude-code-session-id", claudeCodeSessionID)
+		} else {
+			httpReq.Header.Set("x-api-key", req.Account.AuthToken())
+		}
 
-	log.Printf("[ANTHROPIC] %s → %s (stream=%v, %d bytes)", req.Model, url, req.Stream, len(claudeBody))
+		log.Printf("[ANTHROPIC] %s → %s (stream=%v, %d bytes)", req.Model, url, req.Stream, len(claudeBody))
 
-	resp, err := anthropicHTTPClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("upstream request: %w", err)
-	}
+		resp, err = anthropicHTTPClient.Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("upstream request: %w", err)
+		}
+		if resp.StatusCode < 400 {
+			break
+		}
 
-	// Check for HTTP error
-	if resp.StatusCode >= 400 {
-		defer resp.Body.Close()
 		errBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if attempt == 0 && oauth && resp.StatusCode == http.StatusBadRequest &&
+			learnClaudeCodeVersionRequirement(string(errBody)) {
+			continue
+		}
 		return nil, &UpstreamError{
 			StatusCode: resp.StatusCode,
 			Body:       string(errBody),
@@ -351,7 +363,7 @@ func prepareClaudeCodeOAuthBody(body []byte, accountID string) ([]byte, string, 
 	system := []any{
 		map[string]any{
 			"type": "text",
-			"text": "x-anthropic-billing-header: cc_version=" + claudeCodeBillingVersion + "; cc_entrypoint=sdk-cli;",
+			"text": "x-anthropic-billing-header: cc_version=" + claudeCodeBillingVersion() + "; cc_entrypoint=sdk-cli;",
 		},
 		map[string]any{
 			"type": "text",
